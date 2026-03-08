@@ -11,6 +11,7 @@ class ConformerSelfAttention(nn.Module):
     def __init__(
         self, hidden_size: int, num_heads: int, attention_dropout_prob: float
     ) -> None:
+        super().__init__()
         self.layernorm = nn.LayerNorm(hidden_size)
         self.attention = nn.MultiheadAttention(
             hidden_size, num_heads, dropout=attention_dropout_prob, batch_first=True
@@ -24,7 +25,7 @@ class ConformerSelfAttention(nn.Module):
         x = self.layernorm(x)
         xmask = lens_to_mask(xlens)
 
-        x, _ = self.attention.forward(
+        x, _ = self.attention(
             x, x, x, key_padding_mask=xmask
         )  # ignore attn_output_weights
 
