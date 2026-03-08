@@ -4,6 +4,7 @@ import torch.nn as nn
 
 class ConvSubSampling(nn.Module):
     def __init__(self, kernel_size: int, hidden_size: int) -> None:
+        super().__init__()
         self.mod = nn.Sequential(
             nn.Conv2d(1, hidden_size, kernel_size),
             nn.ReLU(inplace=True),
