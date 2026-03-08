@@ -21,7 +21,6 @@ class ConformerSelfAttention(nn.Module):
     def forward(
         self, x: torch.Tensor, xlens: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x_residual = x
         x = self.layernorm(x)
         xmask = lens_to_mask(xlens)
 
@@ -31,4 +30,4 @@ class ConformerSelfAttention(nn.Module):
 
         x = self.dropout(x)
 
-        return x_residual + x, xlens
+        return x, xlens

@@ -121,8 +121,6 @@ class ConformerConv(nn.Module):
     def forward(
         self, x: torch.Tensor, xlens: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x_residual = x
-
         # forward pass
         x = self.layernorm(x)
         x, xlens = self.pointwise_conv1(x, xlens)
@@ -135,4 +133,4 @@ class ConformerConv(nn.Module):
         x, xlens = self.pointwise_conv2(x, xlens)
         x = self.dropout(x)
 
-        return x + x_residual, xlens
+        return x, xlens
