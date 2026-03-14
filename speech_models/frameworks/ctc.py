@@ -21,17 +21,19 @@ class CTCBasedASR(nn.Module):
         super().__init__()
 
         with open(frontend_config_path, "r") as f:
-            frontend_conf = yaml.safe_load(f)["frontend_conf"]
+            c = yaml.safe_load(f)
+            frontend_choice = c["frontend"]
+            frontend_conf = c["frontend_conf"]
         with open(encoder_config_path, "r") as f:
-            encoder_conf = yaml.safe_load(f)["encoder_conf"]
+            c = yaml.safe_load(f)
+            encoder_choice = c["encoder"]
+            encoder_conf = c["encoder_conf"]
 
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.vocab_size
 
-        self.fbank = BatchedFbank(**frontend_conf)
-
-        self.encoder = ConformerEncoder(**encoder_conf)
-
+        self.frontend = frontend_choices[frontend_choice](**frontend_conf)
+        self.encoder = encoder_choices[encoder_choice](**encoder_conf)
         self.ctc_linear = nn.Linear(encoder_conf["hidden_size"], self.vocab_size)
 
         self.criterion = nn.CTCLoss(
@@ -47,7 +49,7 @@ class CTCBasedASR(nn.Module):
             log_probs: (Time, Batch, Vocab) -> CTCLoss直結用
             xlens: (Batch,)
         """
-        x, xlens = self.fbank(wavs, wav_lens)
+        x, xlens = self.frontend(wavs, wav_lens)
         x, xlens = self.encoder(x, xlens)
         logits = self.ctc_linear(x)
         log_probs = logits.float().log_softmax(dim=-1).transpose(0, 1)
