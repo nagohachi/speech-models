@@ -10,6 +10,7 @@ class ConformerBlock(nn.Module):
     def __init__(
         self,
         hidden_size: int,
+        use_rel_positional_attn: bool,
         ffn_dropout_prob: float,
         attention_dropout_prob: float,
         convolution_dropout_prob: float,
@@ -20,7 +21,7 @@ class ConformerBlock(nn.Module):
         super().__init__()
         self.ffn1 = ConformerFFN(hidden_size, ffn_dropout_prob)
         self.attention = ConformerSelfAttention(
-            hidden_size, num_heads, attention_dropout_prob
+            hidden_size, num_heads, attention_dropout_prob, use_rel_positional_attn
         )
         self.conv = ConformerConv(
             hidden_size,
@@ -32,13 +33,13 @@ class ConformerBlock(nn.Module):
         self.layernorm = nn.LayerNorm(hidden_size)
 
     def forward(
-        self, x: torch.Tensor, xlens: torch.Tensor
+        self, x: torch.Tensor, xlens: torch.Tensor, pos_emb: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         ffn1_out, xlens = self.ffn1(x, xlens)
         x = x + 0.5 * ffn1_out
 
-        attn_out, xlens = self.attention(x, xlens)
+        attn_out, xlens = self.attention(x, xlens, pos_emb)
         x = x + attn_out
 
         conv_out, xlens = self.conv(x, xlens)
