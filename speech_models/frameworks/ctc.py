@@ -46,7 +46,7 @@ class CTCBasedASR(nn.Module):
             wavs: (Batch, Time)
             wav_lens: (Batch,)
         Returns:
-            log_probs: (Time, Batch, Vocab) -> CTCLoss直結用
+            log_probs: (Time, Batch, Vocab)
             xlens: (Batch,)
         """
         x, xlens = self.frontend(wavs, wav_lens)
