@@ -1,4 +1,5 @@
 from pathlib import Path
+from turtle import forward
 from typing import Literal
 
 import torch
@@ -103,9 +104,7 @@ class RNNTbasedASR(nn.Module):
         decoder_out, decoder_out_lens = self.decoder(label_tokens, label_token_lens)
 
         # joiner_out: (bs, T, U + 1, vocab_size)
-        joiner_out = self.joiner(
-            encoder_out, encoder_out_lens, decoder_out, decoder_out_lens
-        )
+        joiner_out = self.joiner(encoder_out, decoder_out)
 
         return joiner_out, encoder_out_lens, decoder_out_lens
 
