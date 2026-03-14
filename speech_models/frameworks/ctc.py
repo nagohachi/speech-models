@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -40,7 +41,9 @@ class CTCBasedASR(nn.Module):
             blank=self.tokenizer.blank_token_id, zero_infinity=True
         )
 
-    def forward(self, wavs: torch.Tensor, wav_lens: torch.Tensor):
+    def forward(
+        self, wavs: torch.Tensor, wav_lens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             wavs: (Batch, Time)
@@ -56,7 +59,7 @@ class CTCBasedASR(nn.Module):
 
         return log_probs, xlens
 
-    def get_loss(
+    def _get_loss(
         self,
         log_probs: torch.Tensor,
         targets: torch.Tensor,
@@ -64,3 +67,28 @@ class CTCBasedASR(nn.Module):
         target_lengths: torch.Tensor,
     ) -> torch.Tensor:
         return self.criterion(log_probs, targets, input_lengths, target_lengths)
+
+    def get_loss(
+        self,
+        wavs: torch.Tensor,
+        wav_lens: torch.Tensor,
+        label_tokens: torch.Tensor,
+        label_token_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        log_probs, xlens = self.forward(wavs, wav_lens)
+        return self._get_loss(log_probs, label_tokens, xlens, label_token_lens)
+
+    def inference_forward(
+        self,
+        wavs: torch.Tensor,
+        wav_lens: torch.Tensor,
+        inference_algorithm: Literal["greedy_search"] = "greedy_search",
+    ) -> list[str]:
+        if inference_algorithm != "greedy_search":
+            raise NotImplementedError()
+
+        log_probs, xlens = self.forward(wavs, wav_lens)
+        preds = log_probs.argmax(dim=-1).transpose(0, 1)
+        hyp_tokens = [self.tokenizer.ctc_collapse(pred) for pred in preds]
+
+        return [self.tokenizer.decode(line) for line in hyp_tokens]
