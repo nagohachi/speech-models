@@ -1,5 +1,4 @@
 from pathlib import Path
-from turtle import forward
 from typing import Literal
 
 import torch
@@ -230,7 +229,9 @@ class RNNTbasedASR(nn.Module):
                 # predicted token is not <blank>
                 hypothesis.append(decoded_token_item)
 
-                decoded_token = torch.Tensor([[decoded_token_item]]).long()
+                decoded_token = torch.tensor(
+                    [[decoded_token_item]], device=encoder_out.device, dtype=torch.long
+                )
                 decoder_out_u, decoder_hidden = self.decoder.inference_forward(
                     decoder_hidden, decoded_token
                 )
