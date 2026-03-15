@@ -210,6 +210,10 @@ class RNNTbasedASR(nn.Module):
         for encoder_out_t in encoder_out:  # encoder_out_t: (encoder_hidden_size, )
             encoder_out_t = rearrange(encoder_out_t, "hidden_size -> 1 1 hidden_size")
 
+            # TODO: set in command line
+            max_emit_per_frame = 10
+            emit_count = 0
+
             while True:
                 joiner_out_t_u = self.joiner(
                     encoder_out_t, decoder_out_u
@@ -218,7 +222,10 @@ class RNNTbasedASR(nn.Module):
                 decoded_token_item = joiner_out_t_u.argmax(dim=-1).item()
 
                 # predicted token is <blank>
-                if decoded_token_item == self.tokenizer.blank_token_id:
+                if (
+                    decoded_token_item == self.tokenizer.blank_token_id
+                    or emit_count >= max_emit_per_frame
+                ):
                     break
                 # predicted token is not <blank>
                 hypothesis.append(decoded_token_item)
@@ -227,5 +234,7 @@ class RNNTbasedASR(nn.Module):
                 decoder_out_u, decoder_hidden = self.decoder.inference_forward(
                     decoder_hidden, decoded_token
                 )
+
+                emit_count += 1
 
         return torch.Tensor(hypothesis).long()
