@@ -1,10 +1,17 @@
+from typing import Literal
+
 import torch
 import torch.nn as nn
 
 
 class RNNDecoder(nn.Module):
     def __init__(
-        self, hidden_size: int, vocab_size: int, num_layers: int, dropout: float
+        self,
+        rnn_type: Literal["rnn", "lstm"],
+        hidden_size: int,
+        vocab_size: int,
+        num_layers: int,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -12,13 +19,23 @@ class RNNDecoder(nn.Module):
         self.num_layers = num_layers
         self.embedding = nn.Embedding(vocab_size, hidden_size)
 
-        self.rnn = nn.RNN(
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout,
-        )
+        match rnn_type:
+            case "rnn":
+                self.rnn = nn.RNN(
+                    input_size=hidden_size,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    batch_first=True,
+                    dropout=dropout,
+                )
+            case "lstm":
+                self.rnn = nn.LSTM(
+                    input_size=hidden_size,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    batch_first=True,
+                    dropout=dropout,
+                )
 
     def forward(
         self, x: torch.Tensor, xlens: torch.Tensor
