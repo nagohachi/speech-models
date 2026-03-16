@@ -9,6 +9,7 @@ class RNNDecoder(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
+        self.num_layers = num_layers
         self.embedding = nn.Embedding(vocab_size, hidden_size)
 
         self.rnn = nn.RNN(
