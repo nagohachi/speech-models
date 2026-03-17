@@ -191,10 +191,18 @@ class RNNTbasedASR(nn.Module):
             torch.Tensor: greedy search result of decoded tokens.
         """
         hypothesis = []
-        decoder_hidden = torch.zeros(
+        h_0 = torch.zeros(
             (self.decoder.num_layers, 1, self.decoder.hidden_size),
             device=encoder_out.device,
         )
+
+        match self.decoder.rnn_type:
+            case "lstm":
+                c_0 = torch.zeros_like(h_0)
+                decoder_hidden = (h_0, c_0)
+            case "rnn":
+                decoder_hidden = h_0
+
         decoded_token = torch.tensor(
             [[self.tokenizer.blank_token_id]],
             device=encoder_out.device,
