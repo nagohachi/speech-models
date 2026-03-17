@@ -14,6 +14,7 @@ class RNNDecoder(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
+        self.rnn_type = rnn_type
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.num_layers = num_layers
@@ -58,16 +59,20 @@ class RNNDecoder(nn.Module):
         return output, xlens
 
     def inference_forward(
-        self, previous_hid: torch.Tensor, previous_token: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        previous_hid: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        previous_token: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
         """forward path for inference
 
         Args:
-            previous_hid (torch.Tensor): previous hidden state of shape (num_layers, beam_size, hidden_size).
+            previous_hid (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
+                previous hidden state. For RNN, it's a tensor of shape (num_layers, beam_size, hidden_size).
+                For LSTM, it's a tuple of two tensors, each of shape (num_layers, beam_size, hidden_size).
             previous_token (torch.Tensor): previous token of shape (beam_size, 1)
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: output of shape (beam_size, 1, hidden_size) and hidden state of this step of (num_layers, beam_size, hidden_size).
+            tuple: output of shape (beam_size, 1, hidden_size) and hidden state of this step.
         """
         previous_token_emb = self.embedding(previous_token)
         output, this_step_hid = self.rnn(previous_token_emb, previous_hid)
