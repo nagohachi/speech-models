@@ -151,7 +151,7 @@ class RNNTbasedASR(nn.Module):
         self,
         wavs: torch.Tensor,
         wav_lens: torch.Tensor,
-        inference_algorithm: Literal["greedy_search"] = "greedy_search",
+        inference_algorithm: Literal["greedy_search", "beam_search"] = "greedy_search",
     ) -> list[str]:
         """inference
 
@@ -175,9 +175,8 @@ class RNNTbasedASR(nn.Module):
                 hyp_tokens = self.greedy_search(encoder_out).tolist()
                 hypothesis.append(self.tokenizer.decode(hyp_tokens))
             else:
-                raise NotImplementedError(
-                    "inference algorithms other than greedy search is not implemented."
-                )
+                hyp_tokens = self.beam_search(encoder_out).tolist()
+                hypothesis.append(self.tokenizer.decode(hyp_tokens))
 
         return hypothesis
 
@@ -247,3 +246,143 @@ class RNNTbasedASR(nn.Module):
                 emit_count += 1
 
         return torch.Tensor(hypothesis).long()
+
+    def beam_search(
+        self, encoder_out: torch.Tensor, beam_size: int = 6
+    ) -> torch.Tensor:
+        """batched beam search for transducer to improve inference speed."""
+        import torch.nn.functional as F
+
+        device = encoder_out.device
+        blank_id = self.tokenizer.blank_token_id
+        vocab_size = self.vocab_size
+
+        # --- 初期化 ---
+        h_0 = torch.zeros(
+            (self.decoder.num_layers, 1, self.decoder.hidden_size),
+            device=device,
+        )
+
+        if self.decoder.rnn_type == "lstm":
+            c_0 = torch.zeros_like(h_0)
+            hidden = (h_0, c_0)
+        else:
+            hidden = h_0
+
+        dec_token = torch.tensor([[blank_id]], device=device, dtype=torch.long)
+        dec_out, hidden = self.decoder.inference_forward(hidden, dec_token)
+
+        beam = [{"tokens": [], "logp": 0.0, "hidden": hidden, "dec_out": dec_out}]
+
+        for encoder_out_t in encoder_out:  # (hidden_size, )
+            enc_out_t = rearrange(encoder_out_t, "hidden_size -> 1 1 hidden_size")
+
+            A = beam
+            B = []
+            max_emit = 10
+
+            for _ in range(max_emit):
+                if not A:
+                    break
+
+                batch_A = len(A)
+
+                batched_dec_out = torch.cat([hyp["dec_out"] for hyp in A], dim=0)
+                batched_enc_out = enc_out_t.expand(batch_A, -1, -1)
+
+                joiner_out = self.joiner(batched_enc_out, batched_dec_out)
+                joiner_out = joiner_out.view(batch_A, vocab_size)
+
+                log_probs = F.log_softmax(joiner_out, dim=-1)
+
+                prev_logp = torch.tensor(
+                    [hyp["logp"] for hyp in A], device=device
+                ).unsqueeze(1)
+                total_logp = prev_logp + log_probs  # (batch_A, vocab_size)
+
+                num_candidates = min(beam_size, total_logp.numel())
+                topk_logp, topk_indices = total_logp.view(-1).topk(num_candidates)
+
+                next_A_cands = []
+                for i in range(num_candidates):
+                    logp = topk_logp[i].item()
+                    flat_idx = topk_indices[i].item()
+
+                    hyp_idx = flat_idx // vocab_size
+                    token_id = flat_idx % vocab_size
+
+                    base_hyp = A[hyp_idx]
+
+                    if token_id == blank_id:
+                        B.append(
+                            {
+                                "tokens": base_hyp["tokens"],
+                                "logp": logp,
+                                "hidden": base_hyp["hidden"],
+                                "dec_out": base_hyp["dec_out"],
+                            }
+                        )
+                    else:
+                        next_A_cands.append(
+                            {
+                                "hyp_idx": hyp_idx,
+                                "token_id": token_id,
+                                "logp": logp,
+                                "base_hyp": base_hyp,
+                            }
+                        )
+
+                B = sorted(B, key=lambda x: x["logp"], reverse=True)[:beam_size]
+
+                next_A_cands = sorted(
+                    next_A_cands, key=lambda x: x["logp"], reverse=True
+                )[:beam_size]
+
+                if not next_A_cands:
+                    break
+
+                batch_next_A = len(next_A_cands)
+                batched_tokens = torch.tensor(
+                    [[cand["token_id"]] for cand in next_A_cands],
+                    device=device,
+                    dtype=torch.long,
+                )  # (batch_next_A, 1)
+
+                if self.decoder.rnn_type == "lstm":
+                    h_t = torch.cat(
+                        [cand["base_hyp"]["hidden"][0] for cand in next_A_cands], dim=1
+                    )
+                    c_t = torch.cat(
+                        [cand["base_hyp"]["hidden"][1] for cand in next_A_cands], dim=1
+                    )
+                    batched_hidden = (h_t, c_t)
+                else:
+                    batched_hidden = torch.cat(
+                        [cand["base_hyp"]["hidden"] for cand in next_A_cands], dim=1
+                    )
+
+                new_dec_out, new_hidden = self.decoder.inference_forward(
+                    batched_hidden, batched_tokens
+                )
+
+                A = []
+                for i, cand in enumerate(next_A_cands):
+                    if self.decoder.rnn_type == "lstm":
+                        h_i = new_hidden[0][:, i : i + 1, :].contiguous()
+                        c_i = new_hidden[1][:, i : i + 1, :].contiguous()
+                        hid_i = (h_i, c_i)
+                    else:
+                        hid_i = new_hidden[:, i : i + 1, :].contiguous()
+
+                    A.append(
+                        {
+                            "tokens": cand["base_hyp"]["tokens"] + [cand["token_id"]],
+                            "logp": cand["logp"],
+                            "hidden": hid_i,
+                            "dec_out": new_dec_out[i : i + 1],  # (1, 1, hidden_size)
+                        }
+                    )
+
+            beam = sorted(B + A, key=lambda x: x["logp"], reverse=True)[:beam_size]
+
+        return torch.tensor(beam[0]["tokens"], dtype=torch.long, device=device)
