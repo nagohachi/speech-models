@@ -26,6 +26,10 @@ class RNNTbasedASR(nn.Module):
         decoder_config_path: Path | str,
         joiner_config_path: Path | str,
         tokenizer: BPETokenizer,
+        loss_type: Literal["standard", "pruned"] = "standard",
+        prune_range: int = 5,
+        simple_loss_scaling: float = 0.5,
+        warmup_steps: int = 5000,
     ) -> None:
         super().__init__()
 
@@ -47,6 +51,11 @@ class RNNTbasedASR(nn.Module):
 
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.vocab_size
+        self.loss_type = loss_type
+        self.prune_range = prune_range
+        self.simple_loss_scaling = simple_loss_scaling
+        self.warmup_steps = warmup_steps
+        self.steps_num = 0
 
         self.frontend = frontend_choices[frontend_choice](**frontend_conf)
         self.encoder = encoder_choices[encoder_choice](**encoder_conf)
@@ -55,7 +64,11 @@ class RNNTbasedASR(nn.Module):
         )
         self.joiner = Joiner(**joiner_conf, vocab_size=self.tokenizer.vocab_size)
 
-        self.criterion = RNNTLoss(blank=self.tokenizer.blank_token_id)
+        if loss_type == "standard":
+            self.criterion = RNNTLoss(blank=self.tokenizer.blank_token_id)
+        else:
+            self.am_proj = nn.Linear(encoder_conf["hidden_size"], self.vocab_size)
+            self.lm_proj = nn.Linear(decoder_conf["hidden_size"], self.vocab_size)
 
     def _add_blank(self, label_tokens: torch.Tensor) -> torch.Tensor:
         """add blank at the beginning of label tokens.
@@ -133,6 +146,87 @@ class RNNTbasedASR(nn.Module):
 
         return self.criterion(joiner_out, label_tokens, encoder_out_lens, label_lens)
 
+    def _get_pruned_loss(
+        self,
+        wavs: torch.Tensor,
+        wav_lens: torch.Tensor,
+        label_tokens: torch.Tensor,
+        label_token_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        import k2
+
+        self.steps_num += 1
+
+        if self.steps_num < self.warmup_steps:
+            ratio = self.steps_num / self.warmup_steps
+            pruned_loss_scaling = 0.1 + 0.9 * ratio
+            cur_simple_loss_scaling = 1.0 - ratio * (1.0 - self.simple_loss_scaling)
+        else:
+            pruned_loss_scaling = 1.0
+            cur_simple_loss_scaling = self.simple_loss_scaling
+
+        x, xlens = self.frontend(wavs, wav_lens)
+        encoder_out, encoder_out_lens = self.encoder(x, xlens)
+
+        label_tokens_with_blank = self._add_blank(label_tokens)
+        decoder_out_lens = label_token_lens + 1
+
+        decoder_out, _ = self.decoder(label_tokens_with_blank, decoder_out_lens)
+
+        # boundary: (B, 4)
+        # each row is [begin_symbol, begin_frame, end_symbol, end_frame]
+        batch_size = encoder_out.size(0)
+        boundary = torch.zeros(
+            (batch_size, 4), dtype=torch.int64, device=encoder_out.device
+        )
+        boundary[:, 2] = label_token_lens
+        boundary[:, 3] = encoder_out_lens
+
+        am = self.am_proj(encoder_out)  # (B, T, V)
+        lm = self.lm_proj(decoder_out)  # (B, U+1, V)
+
+        with torch.amp.autocast("cuda", enabled=False):
+            simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                lm=lm.float(),
+                am=am.float(),
+                symbols=label_tokens.long(),
+                termination_symbol=self.tokenizer.blank_token_id,
+                lm_only_scale=0.0,
+                am_only_scale=0.0,
+                boundary=boundary,
+                reduction="mean",
+                return_grad=True,
+            )
+
+        ranges = k2.get_rnnt_prune_ranges(
+            px_grad=px_grad,
+            py_grad=py_grad,
+            boundary=boundary,
+            s_range=self.prune_range,
+        )
+
+        am_pruned, lm_pruned = k2.do_rnnt_pruning(
+            am=self.joiner.lin_enc(encoder_out),
+            lm=self.joiner.lin_dec(decoder_out),
+            ranges=ranges,
+        )
+
+        logits = self.joiner.forward_pruned(
+            am_pruned, lm_pruned
+        )  # (B, T, prune_range, V)
+
+        with torch.amp.autocast("cuda", enabled=False):
+            pruned_loss = k2.rnnt_loss_pruned(
+                logits=logits.float(),
+                symbols=label_tokens.long(),
+                ranges=ranges,
+                termination_symbol=self.tokenizer.blank_token_id,
+                boundary=boundary,
+                reduction="mean",
+            )
+
+        return cur_simple_loss_scaling * simple_loss + pruned_loss_scaling * pruned_loss
+
     def get_loss(
         self,
         wavs: torch.Tensor,
@@ -140,6 +234,8 @@ class RNNTbasedASR(nn.Module):
         label_tokens: torch.Tensor,
         label_token_lens: torch.Tensor,
     ):
+        if self.loss_type == "pruned":
+            return self._get_pruned_loss(wavs, wav_lens, label_tokens, label_token_lens)
         joint_out, encoder_out_lens, decoder_out_lens = self.forward(
             wavs, wav_lens, label_tokens, label_token_lens
         )
