@@ -18,19 +18,13 @@ class Joiner(nn.Module):
         self.lin_out = nn.Linear(hidden_size, vocab_size)
 
     def forward(
-        self,
-        encoder_out: torch.Tensor,
-        encoder_out_lens: torch.Tensor,
-        decoder_out: torch.Tensor,
-        decoder_out_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, encoder_out: torch.Tensor, decoder_out: torch.Tensor
+    ) -> torch.Tensor:
         """forward path.
 
         Args:
             encoder_out (torch.Tensor): encoder output of shape (batch_size, seq_len1, encoder_hidden_size).
-            encoder_out_lens (torch.Tensor): encoder output lengths of shape (batch_size, ).
             decoder_out (torch.Tensor): decoder output of shape (batch_size, seq_len2, decoder_hidden_size).
-            decoder_out_lens (torch.Tensor): decoder output lengths of shape (batch_size, ).
 
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (joiner output, encoder_out_lens, decoder_out_lens).
@@ -47,4 +41,4 @@ class Joiner(nn.Module):
             self.relu(encoder_out_expanded + decoder_out_expanded)
         )
 
-        return joiner_out, encoder_out_lens, decoder_out_lens
+        return joiner_out
