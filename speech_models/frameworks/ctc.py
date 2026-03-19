@@ -82,10 +82,10 @@ class CTCBasedASR(nn.Module):
         self,
         wavs: torch.Tensor,
         wav_lens: torch.Tensor,
-        inference_algorithm: Literal["greedy_search"] = "greedy_search",
+        inference_algorithm: Literal["greedy_search", "beam_search"] = "greedy_search",
     ) -> list[str]:
-        if inference_algorithm != "greedy_search":
-            raise NotImplementedError()
+        # if inference_algorithm != "greedy_search":
+        #     raise NotImplementedError()
 
         log_probs, xlens = self.forward(wavs, wav_lens)
         preds = log_probs.argmax(dim=-1).transpose(0, 1)
