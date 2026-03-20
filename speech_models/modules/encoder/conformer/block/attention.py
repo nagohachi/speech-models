@@ -7,7 +7,7 @@ from speech_models.modules.encoder.conformer.block.utils.multihead_attention imp
 
 
 def lens_to_mask(lens: torch.Tensor) -> torch.Tensor:
-    indices = torch.arange(lens.max().item(), device=lens.device)
+    indices = torch.arange(lens.max(), device=lens.device)  # type: ignore[arg-type]
     return lens.unsqueeze(1) <= indices
 
 

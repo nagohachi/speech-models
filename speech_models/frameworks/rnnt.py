@@ -70,6 +70,11 @@ class RNNTbasedASR(nn.Module):
             self.am_proj = nn.Linear(encoder_conf["hidden_size"], self.vocab_size)
             self.lm_proj = nn.Linear(decoder_conf["hidden_size"], self.vocab_size)
 
+        # Compile forward methods for training speedup
+        self.forward = torch.compile(self.forward, dynamic=True)
+        if loss_type == "pruned":
+            self._pruned_forward = torch.compile(self._pruned_forward, dynamic=True)
+
     def _add_blank(self, label_tokens: torch.Tensor) -> torch.Tensor:
         """add blank at the beginning of label tokens.
 
@@ -146,6 +151,31 @@ class RNNTbasedASR(nn.Module):
 
         return self.criterion(joiner_out, label_tokens, encoder_out_lens, label_lens)
 
+    def _pruned_forward(
+        self,
+        wavs: torch.Tensor,
+        wav_lens: torch.Tensor,
+        label_tokens: torch.Tensor,
+        label_token_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compilable forward portion of the pruned loss path.
+
+        Returns:
+            tuple: (encoder_out, decoder_out, encoder_out_lens, label_token_lens, am, lm)
+        """
+        x, xlens = self.frontend(wavs, wav_lens)
+        encoder_out, encoder_out_lens = self.encoder(x, xlens)
+
+        label_tokens_with_blank = self._add_blank(label_tokens)
+        decoder_out_lens = label_token_lens + 1
+
+        decoder_out, _ = self.decoder(label_tokens_with_blank, decoder_out_lens)
+
+        am = self.am_proj(encoder_out)  # (B, T, V)
+        lm = self.lm_proj(decoder_out)  # (B, U+1, V)
+
+        return encoder_out, decoder_out, encoder_out_lens, label_token_lens, am, lm
+
     def _get_pruned_loss(
         self,
         wavs: torch.Tensor,
@@ -165,13 +195,9 @@ class RNNTbasedASR(nn.Module):
             pruned_loss_scaling = 1.0
             cur_simple_loss_scaling = self.simple_loss_scaling
 
-        x, xlens = self.frontend(wavs, wav_lens)
-        encoder_out, encoder_out_lens = self.encoder(x, xlens)
-
-        label_tokens_with_blank = self._add_blank(label_tokens)
-        decoder_out_lens = label_token_lens + 1
-
-        decoder_out, _ = self.decoder(label_tokens_with_blank, decoder_out_lens)
+        encoder_out, decoder_out, encoder_out_lens, label_token_lens, am, lm = (
+            self._pruned_forward(wavs, wav_lens, label_tokens, label_token_lens)
+        )
 
         # boundary: (B, 4)
         # each row is [begin_symbol, begin_frame, end_symbol, end_frame]
@@ -181,9 +207,6 @@ class RNNTbasedASR(nn.Module):
         )
         boundary[:, 2] = label_token_lens
         boundary[:, 3] = encoder_out_lens
-
-        am = self.am_proj(encoder_out)  # (B, T, V)
-        lm = self.lm_proj(decoder_out)  # (B, U+1, V)
 
         with torch.amp.autocast("cuda", enabled=False):
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
