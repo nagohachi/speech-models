@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 
 from speech_models.modules.encoder.conformer.block.block import ConformerBlock
+from speech_models.modules.encoder.conformer.block.variational_noise import (
+    apply_variational_noise,
+)
 from speech_models.modules.encoder.conformer.conv_subsampling import ConvSubSampling
 from speech_models.modules.encoder.conformer.positional_encoding import (
     RelPositionalEncoding,
@@ -24,6 +27,7 @@ class ConformerEncoder(nn.Module):
         use_rel_positional_attn: bool,
         kernel_size_in_depthwise_conv: int,
         posenc_dropout_prob: float,
+        variational_noise_std: float = 0.0,
     ) -> None:
         super().__init__()
         self.conv_subsampling = ConvSubSampling(
@@ -56,6 +60,8 @@ class ConformerEncoder(nn.Module):
                 for _ in range(num_blocks)
             ]
         )
+
+        apply_variational_noise(self, variational_noise_std)
 
     def forward(
         self, x: torch.Tensor, xlens: torch.Tensor
