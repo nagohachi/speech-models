@@ -30,6 +30,7 @@ class RNNTbasedASR(nn.Module):
         prune_range: int = 5,
         simple_loss_scaling: float = 0.5,
         warmup_steps: int = 5000,
+        use_torch_compile: bool = False,
     ) -> None:
         super().__init__()
 
@@ -70,10 +71,10 @@ class RNNTbasedASR(nn.Module):
             self.am_proj = nn.Linear(encoder_conf["hidden_size"], self.vocab_size)
             self.lm_proj = nn.Linear(decoder_conf["hidden_size"], self.vocab_size)
 
-        # Compile forward methods for training speedup
-        self.forward = torch.compile(self.forward, dynamic=True)
-        if loss_type == "pruned":
-            self._pruned_forward = torch.compile(self._pruned_forward, dynamic=True)
+        if use_torch_compile:
+            self.forward = torch.compile(self.forward, dynamic=True)
+            if loss_type == "pruned":
+                self._pruned_forward = torch.compile(self._pruned_forward, dynamic=True)
 
     def _add_blank(self, label_tokens: torch.Tensor) -> torch.Tensor:
         """add blank at the beginning of label tokens.
