@@ -8,6 +8,7 @@ import yaml
 from einops import rearrange
 from speech_models.modules.decoder.rnn import RNNDecoder
 from speech_models.modules.encoder.conformer.conformer_encoder import ConformerEncoder
+from speech_models.modules.frontend.global_mvn import GlobalMVN
 from speech_models.modules.frontend.log_mel import BatchedFbank
 from speech_models.modules.others.rnnt.joiner import Joiner
 from speech_models.tokenizers.bpe_tokenizer import BPETokenizer
@@ -16,6 +17,7 @@ from torchaudio.transforms import RNNTLoss
 frontend_choices = dict(batched_fbank=BatchedFbank)
 encoder_choices = dict(conformer=ConformerEncoder)
 decoder_choices = dict(rnn=RNNDecoder)
+normalize_choices = dict(global_mvn=GlobalMVN)
 
 
 class RNNTbasedASR(nn.Module):
@@ -38,6 +40,8 @@ class RNNTbasedASR(nn.Module):
             c = yaml.safe_load(f)
             frontend_choice = c["frontend"]
             frontend_conf = c["frontend_conf"]
+            normalize_choice = c.get("normalize")
+            normalize_conf = c.get("normalize_conf", {})
         with open(encoder_config_path, "r") as f:
             c = yaml.safe_load(f)
             encoder_choice = c["encoder"]
@@ -59,6 +63,10 @@ class RNNTbasedASR(nn.Module):
         self.steps_num = 0
 
         self.frontend = frontend_choices[frontend_choice](**frontend_conf)
+        if normalize_choice is not None:
+            self.normalize = normalize_choices[normalize_choice](**normalize_conf)
+        else:
+            self.normalize = None
         self.encoder = encoder_choices[encoder_choice](**encoder_conf)
         self.decoder = decoder_choices[decoder_choice](
             **decoder_conf, vocab_size=self.tokenizer.vocab_size
@@ -111,6 +119,8 @@ class RNNTbasedASR(nn.Module):
             where T := max(encoder out lengths) and U := max(decoder out lengths)
         """
         x, xlens = self.frontend(wavs, wav_lens)
+        if self.normalize is not None:
+            x, xlens = self.normalize(x, xlens)
 
         # encoder_out: (bs, T, hid)
         encoder_out, encoder_out_lens = self.encoder(x, xlens)
@@ -165,6 +175,8 @@ class RNNTbasedASR(nn.Module):
             tuple: (encoder_out, decoder_out, encoder_out_lens, label_token_lens, am, lm)
         """
         x, xlens = self.frontend(wavs, wav_lens)
+        if self.normalize is not None:
+            x, xlens = self.normalize(x, xlens)
         encoder_out, encoder_out_lens = self.encoder(x, xlens)
 
         label_tokens_with_blank = self._add_blank(label_tokens)
@@ -285,6 +297,8 @@ class RNNTbasedASR(nn.Module):
             list[torch.Tensor]: list of hypothesis.
         """
         x, xlens = self.frontend(wavs, wav_lens)
+        if self.normalize is not None:
+            x, xlens = self.normalize(x, xlens)
         x, xlens = self.encoder(x, xlens)
 
         hypothesis = []
