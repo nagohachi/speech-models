@@ -4,11 +4,7 @@ import torch.nn as nn
 from speech_models.modules.encoder.conformer.block.utils.multihead_attention import (
     MultiheadAttentionWithRelPositionalEncoding,
 )
-
-
-def lens_to_mask(lens: torch.Tensor) -> torch.Tensor:
-    indices = torch.arange(lens.max(), device=lens.device)  # type: ignore[arg-type]
-    return lens.unsqueeze(1) <= indices
+from speech_models.modules.utils.mask import lens_to_mask
 
 
 class ConformerSelfAttention(nn.Module):
