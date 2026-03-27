@@ -69,7 +69,9 @@ class RNNTbasedASR(nn.Module):
             self.normalize = None
         self.encoder = encoder_choices[encoder_choice](**encoder_conf)
         self.decoder = decoder_choices[decoder_choice](
-            **decoder_conf, vocab_size=self.tokenizer.vocab_size
+            **decoder_conf,
+            vocab_size=self.tokenizer.vocab_size,
+            pad_token_id=self.tokenizer.pad_token_id,
         )
         self.joiner = Joiner(**joiner_conf, vocab_size=self.tokenizer.vocab_size)
 
@@ -168,7 +170,14 @@ class RNNTbasedASR(nn.Module):
         wav_lens: torch.Tensor,
         label_tokens: torch.Tensor,
         label_token_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Compilable forward portion of the pruned loss path.
 
         Returns:
