@@ -17,7 +17,6 @@ class ConformerEncoder(nn.Module):
         self,
         num_mels: int,
         num_blocks: int,
-        conv_subsample_kernel_size: int,
         hidden_size: int,
         ffn_dropout_prob: float,
         attention_dropout_prob: float,
@@ -28,13 +27,20 @@ class ConformerEncoder(nn.Module):
         kernel_size_in_depthwise_conv: int,
         posenc_dropout_prob: float,
         variational_noise_std: float = 0.0,
+        use_subsampling: bool = True,
+        conv_subsample_kernel_size: int = 3,
     ) -> None:
         super().__init__()
-        self.conv_subsampling = ConvSubSampling(
-            conv_subsample_kernel_size, hidden_size, num_mels
-        )
 
+        self.use_subsampling = use_subsampling
         self.use_rel_positional_attn = use_rel_positional_attn
+
+        if self.use_subsampling:
+            self.input_proj = ConvSubSampling(
+                conv_subsample_kernel_size, hidden_size, num_mels
+            )
+        else:
+            self.input_proj = nn.Linear(num_mels, hidden_size)
 
         if self.use_rel_positional_attn:
             self.positional_encoding = RelPositionalEncoding(
@@ -66,7 +72,10 @@ class ConformerEncoder(nn.Module):
     def forward(
         self, x: torch.Tensor, xlens: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x, xlens = self.conv_subsampling(x, xlens)
+        if self.use_subsampling:
+            x, xlens = self.input_proj(x, xlens)
+        else:
+            x = self.input_proj(x)
 
         if self.use_rel_positional_attn:
             x, pos_emb = self.positional_encoding(x)
