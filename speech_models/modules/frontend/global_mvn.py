@@ -47,7 +47,9 @@ class GlobalMVN(nn.Module):
 
         std = np.sqrt(np.maximum(var, eps))
 
-        self.register_buffer("mean", torch.from_numpy(np.asarray(mean, dtype=np.float32)))
+        self.register_buffer(
+            "mean", torch.from_numpy(np.asarray(mean, dtype=np.float32))
+        )
         self.register_buffer("std", torch.from_numpy(np.asarray(std, dtype=np.float32)))
 
     def extra_repr(self) -> str:
@@ -69,7 +71,7 @@ class GlobalMVN(nn.Module):
             Normalized features and lengths (unchanged).
         """
         if self.norm_means:
-            x = x - self.mean
+            x = x - self.mean  # type: ignore
         if self.norm_vars:
-            x = x / self.std
+            x = x / self.std  # type: ignore
         return x, xlens
