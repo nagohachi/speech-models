@@ -6,7 +6,7 @@ from speech_models.modules.encoder.conformer.block.variational_noise import (
     apply_variational_noise,
 )
 from speech_models.modules.encoder.conformer.conv_subsampling import ConvSubSampling
-from speech_models.modules.encoder.conformer.positional_encoding import (
+from speech_models.modules.utils.positional_encoding import (
     RelPositionalEncoding,
     SinusoidalPositionalEncoding,
 )
