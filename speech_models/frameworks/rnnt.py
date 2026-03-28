@@ -33,6 +33,7 @@ class RNNTbasedASR(nn.Module):
         simple_loss_scaling: float = 0.5,
         warmup_steps: int = 5000,
         use_torch_compile: bool = False,
+        feats_stats_path: Path | str | None = None,
     ) -> None:
         super().__init__()
 
@@ -64,6 +65,8 @@ class RNNTbasedASR(nn.Module):
 
         self.frontend = frontend_choices[frontend_choice](**frontend_conf)
         if normalize_choice is not None:
+            if feats_stats_path is not None:
+                normalize_conf["stats_file"] = str(feats_stats_path)
             self.normalize = normalize_choices[normalize_choice](**normalize_conf)
         else:
             self.normalize = None

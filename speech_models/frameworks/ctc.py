@@ -5,11 +5,13 @@ import torch
 import torch.nn as nn
 import yaml
 from speech_models.modules.encoder.conformer.conformer_encoder import ConformerEncoder
+from speech_models.modules.frontend.global_mvn import GlobalMVN
 from speech_models.modules.frontend.log_mel import BatchedFbank
 from speech_models.tokenizers.bpe_tokenizer import BPETokenizer
 
 frontend_choices = dict(batched_fbank=BatchedFbank)
 encoder_choices = dict(conformer=ConformerEncoder)
+normalize_choices = dict(global_mvn=GlobalMVN)
 
 
 class CTCBasedASR(nn.Module):
@@ -18,6 +20,7 @@ class CTCBasedASR(nn.Module):
         frontend_config_path: Path | str,
         encoder_config_path: Path | str,
         tokenizer: BPETokenizer,
+        feats_stats_path: Path | str | None = None,
     ) -> None:
         super().__init__()
 
@@ -25,6 +28,8 @@ class CTCBasedASR(nn.Module):
             c = yaml.safe_load(f)
             frontend_choice = c["frontend"]
             frontend_conf = c["frontend_conf"]
+            normalize_choice = c.get("normalize")
+            normalize_conf = c.get("normalize_conf", {})
         with open(encoder_config_path, "r") as f:
             c = yaml.safe_load(f)
             encoder_choice = c["encoder"]
@@ -34,6 +39,12 @@ class CTCBasedASR(nn.Module):
         self.vocab_size = tokenizer.vocab_size
 
         self.frontend = frontend_choices[frontend_choice](**frontend_conf)
+        if normalize_choice is not None:
+            if feats_stats_path is not None:
+                normalize_conf["stats_file"] = str(feats_stats_path)
+            self.normalize = normalize_choices[normalize_choice](**normalize_conf)
+        else:
+            self.normalize = None
         self.encoder = encoder_choices[encoder_choice](**encoder_conf)
         self.ctc_linear = nn.Linear(encoder_conf["hidden_size"], self.vocab_size)
 
@@ -53,6 +64,8 @@ class CTCBasedASR(nn.Module):
             xlens: (Batch,)
         """
         x, xlens = self.frontend(wavs, wav_lens)
+        if self.normalize is not None:
+            x, xlens = self.normalize(x, xlens)
         x, xlens = self.encoder(x, xlens)
         logits = self.ctc_linear(x)
         log_probs = logits.float().log_softmax(dim=-1).transpose(0, 1)
