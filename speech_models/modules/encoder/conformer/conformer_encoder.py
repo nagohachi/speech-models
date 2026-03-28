@@ -34,6 +34,7 @@ class ConformerEncoder(nn.Module):
 
         self.use_subsampling = use_subsampling
         self.use_rel_positional_attn = use_rel_positional_attn
+        self.hidden_size = hidden_size
 
         if self.use_subsampling:
             self.input_proj = ConvSubSampling(
