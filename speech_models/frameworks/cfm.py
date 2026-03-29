@@ -132,7 +132,7 @@ class CFMbasedModel(nn.Module):
         gnoise = torch.randn_like(gt_mels)
 
         text_embeds = self.embedding(text_tokens)
-        text_encoded = self.encoder(
+        text_encoded, _ = self.encoder(
             text_embeds, text_token_lens
         )  # (batch_size, seq_len, enc_hid)
 
@@ -153,10 +153,61 @@ class CFMbasedModel(nn.Module):
         )  # (batch_size, 1, decoder_hid)
 
         # simply added together and input to decoder
-        decoder_out = self.decoder(
+        decoder_out, _ = self.decoder(
             text_encoded_upsampled + mel_t + embed_t, gt_mel_lens
         )
         return self.post_decoder_proj(decoder_out), gt_mel_lens, gnoise
+
+    @torch.inference_mode()
+    def inference_forward(
+        self,
+        text_tokens: torch.Tensor,
+        text_token_lens: torch.Tensor,
+        mel_lens: torch.Tensor,
+        n_timesteps: int = 10,
+    ) -> torch.Tensor:
+        """Generate mel spectrograms from text via Euler ODE solver.
+
+        Args:
+            text_tokens (torch.Tensor): Text token ids of shape (batch_size, seq_len).
+            text_token_lens (torch.Tensor): Text token lengths of shape (batch_size,).
+            mel_lens (torch.Tensor): Target mel lengths of shape (batch_size,).
+            n_timesteps (int): Number of Euler steps.
+
+        Returns:
+            torch.Tensor: Generated mel spectrogram of shape (batch_size, max_mel_len, mel_dim).
+        """
+        text_embeds = self.embedding(text_tokens)
+        text_encoded, _ = self.encoder(text_embeds, text_token_lens)
+
+        mu = self.post_encoder_proj(
+            self.upsample(text_encoded, text_token_lens, mel_lens)
+        )  # (batch_size, max_mel_len, decoder_hid)
+
+        max_mel_len = int(mel_lens.max().item())
+        nmels = self.pre_decoder_proj.in_features
+        x = torch.randn(
+            text_tokens.size(0), max_mel_len, nmels, device=text_tokens.device
+        )
+
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=text_tokens.device)
+
+        for step in range(n_timesteps):
+            t = t_span[step]
+            dt = t_span[step + 1] - t
+
+            time_steps = t.expand(text_tokens.size(0))
+            x_proj = self.pre_decoder_proj(x)
+            embed_t = einops.rearrange(
+                self.time_step_embedding(time_steps), "bs dec_hid -> bs 1 dec_hid"
+            )
+
+            decoder_out, _ = self.decoder(mu + x_proj + embed_t, mel_lens)
+            dphi_dt = self.post_decoder_proj(decoder_out)
+
+            x = x + dt * dphi_dt
+
+        return x
 
     def get_loss(
         self,
