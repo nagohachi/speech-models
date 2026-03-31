@@ -42,3 +42,17 @@ class Joiner(nn.Module):
         )
 
         return joiner_out
+
+    def forward_pruned(
+        self, am_pruned: torch.Tensor, lm_pruned: torch.Tensor
+    ) -> torch.Tensor:
+        """Forward for pruned RNNT loss.
+
+        Args:
+            am_pruned: (B, T, prune_range, hidden_size) — already projected by lin_enc.
+            lm_pruned: (B, T, prune_range, hidden_size) — already projected by lin_dec.
+
+        Returns:
+            Logits of shape (B, T, prune_range, vocab_size).
+        """
+        return self.lin_out(self.relu(am_pruned + lm_pruned))

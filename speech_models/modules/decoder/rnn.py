@@ -12,13 +12,14 @@ class RNNDecoder(nn.Module):
         vocab_size: int,
         num_layers: int,
         dropout: float,
+        pad_token_id: int,
     ) -> None:
         super().__init__()
         self.rnn_type = rnn_type
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.num_layers = num_layers
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
 
         match rnn_type:
             case "rnn":
