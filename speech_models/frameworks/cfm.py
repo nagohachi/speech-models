@@ -110,9 +110,25 @@ class CFMbasedModel(nn.Module):
 
         return upsampled
 
-    def _make_mask(self, mel_lens: torch.Tensor) -> torch.Tensor:
+    def _make_mask(self, mel_lens: torch.Tensor, max_len: int | None = None) -> torch.Tensor:
         """Create float mask (B, 1, T) where 1=valid, 0=pad."""
+        if max_len is not None:
+            indices = torch.arange(max_len, device=mel_lens.device)
+            return (indices.unsqueeze(0) < mel_lens.unsqueeze(1)).unsqueeze(1).float()
         return (~lens_to_mask(mel_lens)).unsqueeze(1).float()
+
+    def _fix_len(self, length: int) -> int:
+        """Round up length to be compatible with UNet downsampling."""
+        assert isinstance(self.decoder, ResNet1DUNet)
+        factor = 2 ** self.decoder.num_downsamplings
+        return int((length + factor - 1) // factor * factor)
+
+    def _pad_to_len(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Pad (B, T, D) tensor along T to target_len."""
+        pad_size = target_len - x.size(1)
+        if pad_size > 0:
+            return torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+        return x
 
     def _forward_unet(
         self,
@@ -122,29 +138,38 @@ class CFMbasedModel(nn.Module):
         gt_mel_lens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = gt_mels.size(0)
+        orig_mel_len = gt_mels.size(1)
+        fixed_len = self._fix_len(orig_mel_len)
 
         time_steps = torch.rand(batch_size, device=gt_mels.device)
-        gnoise = torch.randn_like(gt_mels)
+        gnoise = torch.randn(
+            batch_size, fixed_len, gt_mels.size(2), device=gt_mels.device
+        )
 
         text_embeds = self.embedding(text_tokens)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
 
-        # mu: (B, T, mel_dim) -> (B, mel_dim, T)
+        # mu: (B, T_fixed, mel_dim) -> (B, mel_dim, T_fixed)
         mu = self.post_encoder_proj(
-            self.upsample(text_encoded, text_token_lens, gt_mel_lens)
+            self._pad_to_len(
+                self.upsample(text_encoded, text_token_lens, gt_mel_lens), fixed_len
+            )
         ).transpose(1, 2)
 
-        # x_t: (B, T, mel_dim) -> (B, mel_dim, T)
+        # x_t: (B, T_fixed, mel_dim) -> (B, mel_dim, T_fixed)
+        gt_mels_padded = self._pad_to_len(gt_mels, fixed_len)
         t = time_steps[:, None, None]
-        x_t = ((1 - t) * gnoise + t * gt_mels).transpose(1, 2)
+        x_t = ((1 - t) * gnoise + t * gt_mels_padded).transpose(1, 2)
 
-        mask = self._make_mask(gt_mel_lens)
+        mask = self._make_mask(gt_mel_lens, max_len=fixed_len)
 
-        # UNet: (B, mel_dim, T) -> (B, mel_dim, T)
+        # UNet: (B, mel_dim, T_fixed) -> (B, mel_dim, T_fixed)
         decoder_out = self.decoder(x_t, mask, mu, time_steps)
 
-        # (B, mel_dim, T) -> (B, T, mel_dim)
-        return decoder_out.transpose(1, 2), gt_mel_lens, gnoise
+        # trim back and transpose: (B, mel_dim, T_fixed) -> (B, T_orig, mel_dim)
+        decoder_out = decoder_out[:, :, :orig_mel_len].transpose(1, 2)
+        gnoise = gnoise[:, :orig_mel_len, :]
+        return decoder_out, gt_mel_lens, gnoise
 
     def _forward_conformer(
         self,
@@ -236,12 +261,16 @@ class CFMbasedModel(nn.Module):
         if self.use_unet:
             assert isinstance(self.decoder, ResNet1DUNet)
             nmels = self.decoder.out_channels
-            mu = self.post_encoder_proj(
-                self.upsample(text_encoded, text_token_lens, mel_lens)
-            ).transpose(1, 2)  # (B, mel_dim, T)
+            fixed_len = self._fix_len(max_mel_len)
 
-            mask = self._make_mask(mel_lens)
-            x = torch.randn(batch_size, nmels, max_mel_len, device=text_tokens.device)
+            mu = self.post_encoder_proj(
+                self._pad_to_len(
+                    self.upsample(text_encoded, text_token_lens, mel_lens), fixed_len
+                )
+            ).transpose(1, 2)  # (B, mel_dim, T_fixed)
+
+            mask = self._make_mask(mel_lens, max_len=fixed_len)
+            x = torch.randn(batch_size, nmels, fixed_len, device=text_tokens.device)
 
             t_span = torch.linspace(0, 1, n_timesteps + 1, device=text_tokens.device)
             for step in range(n_timesteps):
@@ -251,7 +280,7 @@ class CFMbasedModel(nn.Module):
                 dphi_dt = self.decoder(x, mask, mu, time_steps)
                 x = x + dt * dphi_dt
 
-            return x.transpose(1, 2)  # (B, T, mel_dim)
+            return x[:, :, :max_mel_len].transpose(1, 2)  # (B, T, mel_dim)
 
         else:
             nmels = self.pre_decoder_proj.in_features
@@ -291,5 +320,4 @@ class CFMbasedModel(nn.Module):
         mask = ~lens_to_mask(gt_mel_lens).unsqueeze(-1)  # (batch_size, mel_seq_len, 1)
 
         loss = self.criterion(decoder_out, target)  # (batch_size, mel_seq_len, dim)
-        n_feats = decoder_out.size(-1)
-        return (loss * mask).sum() / (mask.sum() * n_feats)
+        return (loss * mask).sum() / mask.sum()
