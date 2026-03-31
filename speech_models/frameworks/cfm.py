@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import einops
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -23,6 +24,10 @@ class CFMbasedModel(nn.Module):
         decoder_config_path: Path | str,
         tokenizer: BPETokenizer | CharTokenizer,
         nmels: int,
+        sigma_min: float = 0.0,
+        use_prior_loss: bool = False,
+        normalize_mel: bool = True,
+        mel_stats_path: Path | str | None = None,
     ) -> None:
         super().__init__()
         with open(encoder_config_path, "r") as f:
@@ -36,6 +41,8 @@ class CFMbasedModel(nn.Module):
 
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.vocab_size
+        self.sigma_min = sigma_min
+        self.use_prior_loss = use_prior_loss
 
         # text encoder
         self.encoder = encoder_choices[encoder_choice](**encoder_conf)
@@ -66,7 +73,34 @@ class CFMbasedModel(nn.Module):
                 output_size=dec_hidden_size,
             )
 
+        # mel normalization
+        self.mel_mean: torch.Tensor
+        self.mel_std: torch.Tensor
+        if normalize_mel and mel_stats_path is not None:
+            stats = np.load(mel_stats_path)
+            count = stats["count"]
+            mean = stats["sum"] / count
+            var = stats["sum_square"] / count - mean * mean
+            std = np.sqrt(np.maximum(var, 1e-20))
+            self.register_buffer("mel_mean", torch.from_numpy(mean.astype(np.float32)))
+            self.register_buffer("mel_std", torch.from_numpy(std.astype(np.float32)))
+            self._normalize_mel = True
+        else:
+            self._normalize_mel = False
+
         self.criterion = nn.MSELoss(reduction="none")
+
+    def _normalize(self, mel: torch.Tensor) -> torch.Tensor:
+        """Normalize mel: (B, T, D)."""
+        if self._normalize_mel:
+            return (mel - self.mel_mean) / self.mel_std
+        return mel
+
+    def _denormalize(self, mel: torch.Tensor) -> torch.Tensor:
+        """Denormalize mel: (B, T, D)."""
+        if self._normalize_mel:
+            return mel * self.mel_std + self.mel_mean
+        return mel
 
     def upsample(
         self,
@@ -136,10 +170,11 @@ class CFMbasedModel(nn.Module):
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = gt_mels.size(0)
         orig_mel_len = gt_mels.size(1)
         fixed_len = self._fix_len(orig_mel_len)
+        s = self.sigma_min
 
         time_steps = torch.rand(batch_size, device=gt_mels.device)
         gnoise = torch.randn(
@@ -150,16 +185,17 @@ class CFMbasedModel(nn.Module):
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
 
         # mu: (B, T_fixed, mel_dim) -> (B, mel_dim, T_fixed)
-        mu = self.post_encoder_proj(
+        mu_bt = self.post_encoder_proj(
             self._pad_to_len(
                 self.upsample(text_encoded, text_token_lens, gt_mel_lens), fixed_len
             )
-        ).transpose(1, 2)
+        )
+        mu = mu_bt.transpose(1, 2)
 
         # x_t: (B, T_fixed, mel_dim) -> (B, mel_dim, T_fixed)
         gt_mels_padded = self._pad_to_len(gt_mels, fixed_len)
         t = time_steps[:, None, None]
-        x_t = ((1 - t) * gnoise + t * gt_mels_padded).transpose(1, 2)
+        x_t = ((1 - (1 - s) * t) * gnoise + t * gt_mels_padded).transpose(1, 2)
 
         mask = self._make_mask(gt_mel_lens, max_len=fixed_len)
 
@@ -169,7 +205,8 @@ class CFMbasedModel(nn.Module):
         # trim back and transpose: (B, mel_dim, T_fixed) -> (B, T_orig, mel_dim)
         decoder_out = decoder_out[:, :, :orig_mel_len].transpose(1, 2)
         gnoise = gnoise[:, :orig_mel_len, :]
-        return decoder_out, gt_mel_lens, gnoise
+        mu_bt = mu_bt[:, :orig_mel_len, :]
+        return decoder_out, mu_bt, gt_mel_lens, gnoise
 
     def _forward_conformer(
         self,
@@ -177,8 +214,9 @@ class CFMbasedModel(nn.Module):
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = gt_mels.size(0)
+        s = self.sigma_min
 
         time_steps = torch.rand(batch_size, device=gt_mels.device)
         gnoise = torch.randn_like(gt_mels)
@@ -186,13 +224,13 @@ class CFMbasedModel(nn.Module):
         text_embeds = self.embedding(text_tokens)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
 
-        text_encoded_upsampled = self.post_encoder_proj(
+        mu = self.post_encoder_proj(
             self.upsample(text_encoded, text_token_lens, gt_mel_lens)
         )
 
         time_steps_unsq = time_steps[:, None, None]
         mel_t = self.pre_decoder_proj(
-            (1 - time_steps_unsq) * gnoise + time_steps_unsq * gt_mels
+            (1 - (1 - s) * time_steps_unsq) * gnoise + time_steps_unsq * gt_mels
         )
 
         embed_t = einops.rearrange(
@@ -200,9 +238,9 @@ class CFMbasedModel(nn.Module):
         )
 
         decoder_out, _ = self.decoder(
-            text_encoded_upsampled + mel_t + embed_t, gt_mel_lens
+            mu + mel_t + embed_t, gt_mel_lens
         )
-        return self.post_decoder_proj(decoder_out), gt_mel_lens, gnoise
+        return self.post_decoder_proj(decoder_out), mu, gt_mel_lens, gnoise
 
     def forward(
         self,
@@ -210,7 +248,7 @@ class CFMbasedModel(nn.Module):
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward path of CFM.
 
         Args:
@@ -220,10 +258,7 @@ class CFMbasedModel(nn.Module):
             gt_mel_lens (torch.Tensor): GT mel lengths of shape (batch_size,).
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - Predicted velocity field of shape (batch_size, seq_len, mel_dim).
-                - mel spectrogram lengths.
-                - gaussian noise.
+            tuple: (decoder_out, mu, mel_lens, gnoise).
         """
         if self.use_unet:
             return self._forward_unet(
@@ -280,7 +315,7 @@ class CFMbasedModel(nn.Module):
                 dphi_dt = self.decoder(x, mask, mu, time_steps)
                 x = x + dt * dphi_dt
 
-            return x[:, :, :max_mel_len].transpose(1, 2)  # (B, T, mel_dim)
+            return self._denormalize(x[:, :, :max_mel_len].transpose(1, 2))  # (B, T, mel_dim)
 
         else:
             nmels = self.pre_decoder_proj.in_features
@@ -303,7 +338,7 @@ class CFMbasedModel(nn.Module):
                 dphi_dt = self.post_decoder_proj(decoder_out)
                 x = x + dt * dphi_dt
 
-            return x
+            return self._denormalize(x)
 
     def get_loss(
         self,
@@ -311,13 +346,26 @@ class CFMbasedModel(nn.Module):
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        decoder_out, gt_mel_lens, gnoise = self.forward(
+    ) -> dict[str, torch.Tensor]:
+        gt_mels = self._normalize(gt_mels)
+        decoder_out, mu, gt_mel_lens, gnoise = self.forward(
             text_tokens, text_token_lens, gt_mels, gt_mel_lens
         )
-        target = gt_mels - gnoise
+        s = self.sigma_min
+        target = gt_mels - (1 - s) * gnoise
 
         mask = ~lens_to_mask(gt_mel_lens).unsqueeze(-1)  # (batch_size, mel_seq_len, 1)
 
-        loss = self.criterion(decoder_out, target)  # (batch_size, mel_seq_len, dim)
-        return (loss * mask).sum() / mask.sum()
+        diff_loss = self.criterion(decoder_out, target)
+        diff_loss = (diff_loss * mask).sum() / mask.sum()
+
+        losses: dict[str, torch.Tensor] = {"diff_loss": diff_loss}
+
+        if self.use_prior_loss:
+            import math
+
+            prior = 0.5 * ((gt_mels - mu) ** 2 + math.log(2 * math.pi))
+            prior_loss = (prior * mask).sum() / mask.sum()
+            losses["prior_loss"] = prior_loss
+
+        return losses
