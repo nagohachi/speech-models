@@ -233,7 +233,7 @@ class RNNTbasedASR(nn.Module):
         boundary[:, 2] = label_token_lens
         boundary[:, 3] = encoder_out_lens
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):  # type: ignore
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
                 lm=lm.float(),
                 am=am.float(),
@@ -263,7 +263,7 @@ class RNNTbasedASR(nn.Module):
             am_pruned, lm_pruned
         )  # (B, T, prune_range, V)
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):  # type: ignore
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),
                 symbols=label_tokens.long(),
@@ -454,7 +454,7 @@ class RNNTbasedASR(nn.Module):
                     logp = topk_logp[i].item()
                     flat_idx = topk_indices[i].item()
 
-                    hyp_idx = flat_idx // vocab_size
+                    hyp_idx = int(flat_idx // vocab_size)
                     token_id = flat_idx % vocab_size
 
                     base_hyp = A[hyp_idx]
@@ -487,7 +487,6 @@ class RNNTbasedASR(nn.Module):
                 if not next_A_cands:
                     break
 
-                batch_next_A = len(next_A_cands)
                 batched_tokens = torch.tensor(
                     [[cand["token_id"]] for cand in next_A_cands],
                     device=device,
@@ -518,7 +517,7 @@ class RNNTbasedASR(nn.Module):
                         c_i = new_hidden[1][:, i : i + 1, :].contiguous()
                         hid_i = (h_i, c_i)
                     else:
-                        hid_i = new_hidden[:, i : i + 1, :].contiguous()
+                        hid_i = new_hidden[:, i : i + 1, :].contiguous()  # type: ignore
 
                     A.append(
                         {
