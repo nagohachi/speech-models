@@ -382,7 +382,7 @@ class CFMbasedModel(nn.Module):
         mel_lens: torch.Tensor | None = None,
         n_timesteps: int = 10,
         length_scale: float = 1.0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate mel spectrograms from text via Euler ODE solver.
 
         Args:
@@ -393,7 +393,9 @@ class CFMbasedModel(nn.Module):
             length_scale: Duration scaling factor (inference only).
 
         Returns:
-            Generated mel spectrogram (batch_size, max_mel_len, mel_dim).
+            Tuple of (generated_mels, mel_lens).
+            generated_mels: (batch_size, max_mel_len, mel_dim).
+            mel_lens: (batch_size,).
         """
         text_embeds = self.embedding(text_tokens)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
@@ -429,7 +431,7 @@ class CFMbasedModel(nn.Module):
                 dphi_dt = self.decoder(x, mask, mu, t.expand(batch_size))
                 x = x + dt * dphi_dt
 
-            return self._denormalize(x[:, :, :max_mel_len].transpose(1, 2))
+            return self._denormalize(x[:, :, :max_mel_len].transpose(1, 2)), mel_lens
 
         else:
             nmels = self.pre_decoder_proj.in_features
@@ -450,7 +452,7 @@ class CFMbasedModel(nn.Module):
                 dphi_dt = self.post_decoder_proj(decoder_out)
                 x = x + dt * dphi_dt
 
-            return self._denormalize(x)
+            return self._denormalize(x), mel_lens
 
     # ------------------------------------------------------------------
     # Loss
