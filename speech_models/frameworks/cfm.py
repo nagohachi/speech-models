@@ -473,7 +473,8 @@ class CFMbasedModel(nn.Module):
         mask = ~lens_to_mask(gt_mel_lens).unsqueeze(-1)  # (B, T, 1)
 
         diff_loss = self.criterion(decoder_out, target)
-        diff_loss = (diff_loss * mask).sum() / mask.sum()
+        n_feats = gt_mels.size(-1)
+        diff_loss = (diff_loss * mask).sum() / (mask.sum() * n_feats)
 
         losses: dict[str, torch.Tensor] = {"diff_loss": diff_loss}
 
@@ -482,7 +483,7 @@ class CFMbasedModel(nn.Module):
 
         if self.use_prior_loss:
             prior = 0.5 * ((gt_mels - mu_prior) ** 2 + math.log(2 * math.pi))
-            prior_loss = (prior * mask).sum() / mask.sum()
+            prior_loss = (prior * mask).sum() / (mask.sum() * n_feats)
             losses["prior_loss"] = prior_loss
 
         return losses
