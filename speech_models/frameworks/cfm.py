@@ -33,6 +33,9 @@ class CFMbasedModel(nn.Module):
         use_prior_loss: bool = False,
         normalize_mel: bool = True,
         mel_stats_path: Path | str | None = None,
+        speaker_conditioning: str = "ref_mel",
+        num_speakers: int = 0,
+        speaker_emb_dim: int = 64,
     ) -> None:
         super().__init__()
         with open(encoder_config_path, "r") as f:
@@ -49,6 +52,7 @@ class CFMbasedModel(nn.Module):
         self.sigma_min = sigma_min
         self.use_prior_loss = use_prior_loss
         self.nmels = nmels
+        self.speaker_conditioning = speaker_conditioning
 
         # text encoder
         self.encoder = encoder_choices[encoder_choice](**encoder_conf)
@@ -62,6 +66,11 @@ class CFMbasedModel(nn.Module):
                 in_channels=enc_hidden, **dp_conf
             )
             self.proj_mu = nn.Linear(enc_hidden, nmels)
+
+        # speaker embedding (only for speaker_id conditioning)
+        if speaker_conditioning == "speaker_id" and num_speakers > 0:
+            self.speaker_embedding = nn.Embedding(num_speakers, speaker_emb_dim)
+            decoder_conf["spk_emb_dim"] = speaker_emb_dim
 
         # noise decoder
         self.decoder = decoder_choices[decoder_choice](**decoder_conf)
@@ -255,18 +264,16 @@ class CFMbasedModel(nn.Module):
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
+        ref_mels: torch.Tensor | None = None,
+        ref_mel_lens: torch.Tensor | None = None,
+        speaker_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
     ]:
         batch_size = gt_mels.size(0)
-        orig_mel_len = gt_mels.size(1)
-        fixed_len = self._fix_len(orig_mel_len)
         s = self.sigma_min
 
         time_steps = torch.rand(batch_size, device=gt_mels.device)
-        gnoise = torch.randn(
-            batch_size, fixed_len, gt_mels.size(2), device=gt_mels.device
-        )
 
         text_embeds = self.embedding(text_tokens)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
@@ -275,21 +282,65 @@ class CFMbasedModel(nn.Module):
             text_encoded, text_token_lens, gt_mels, gt_mel_lens
         )
 
-        mu_bt = self.post_encoder_proj(self._pad_to_len(aligned_enc, fixed_len))
+        # Speaker embedding for speaker_id mode
+        spk_emb = None
+        if self.speaker_conditioning == "speaker_id" and speaker_ids is not None:
+            spk_emb = self.speaker_embedding(speaker_ids)  # (B, spk_emb_dim)
+
+        # Determine total length with optional reference mel prefix
+        use_ref = self.speaker_conditioning == "ref_mel" and ref_mels is not None and ref_mel_lens is not None
+        if use_ref:
+            assert ref_mels is not None and ref_mel_lens is not None
+            max_ref_len = int(ref_mel_lens.max().item())
+            ref_mels_trimmed = ref_mels[:, :max_ref_len, :]
+            total_mel_len = max_ref_len + gt_mels.size(1)
+            total_mel_lens = ref_mel_lens + gt_mel_lens
+        else:
+            max_ref_len = 0
+            total_mel_len = gt_mels.size(1)
+            total_mel_lens = gt_mel_lens
+
+        fixed_len = self._fix_len(total_mel_len)
+
+        # Build mu: [ref_mel | post_encoder_proj(aligned_enc)] -> (B, T_total, nmels)
+        mu_target = self.post_encoder_proj(
+            self._pad_to_len(aligned_enc, fixed_len - max_ref_len)
+        )
+        if use_ref:
+            mu_ref = self._pad_to_len(ref_mels_trimmed, max_ref_len)
+            mu_bt = torch.cat([mu_ref, mu_target], dim=1)[:, :fixed_len, :]
+        else:
+            mu_bt = mu_target[:, :fixed_len, :]
         mu = mu_bt.transpose(1, 2)  # (B, mel_dim, T_fixed)
 
-        gt_mels_padded = self._pad_to_len(gt_mels, fixed_len)
+        # Build x_t: for ref portion use clean ref_mel, for target portion use noised
+        gnoise_target = torch.randn(
+            batch_size, fixed_len - max_ref_len, gt_mels.size(2), device=gt_mels.device
+        )
+        gt_mels_padded = self._pad_to_len(gt_mels, fixed_len - max_ref_len)
         t = time_steps[:, None, None]
-        x_t = ((1 - (1 - s) * t) * gnoise + t * gt_mels_padded).transpose(1, 2)
+        x_t_target = (1 - (1 - s) * t) * gnoise_target + t * gt_mels_padded
 
-        mask = self._make_mask(gt_mel_lens, max_len=fixed_len)
-        decoder_out = self.decoder(x_t, mask, mu, time_steps)
+        if use_ref:
+            ref_padded = self._pad_to_len(ref_mels_trimmed, max_ref_len)
+            x_t = torch.cat([ref_padded, x_t_target], dim=1).transpose(1, 2)
+        else:
+            x_t = x_t_target.transpose(1, 2)
 
-        decoder_out = decoder_out[:, :, :orig_mel_len].transpose(1, 2)
-        gnoise = gnoise[:, :orig_mel_len, :]
+        mask = self._make_mask(total_mel_lens, max_len=fixed_len)
+        decoder_out = self.decoder(x_t, mask, mu, time_steps, spk_emb=spk_emb)
+
+        # Extract only target portion for loss computation
+        orig_target_len = gt_mels.size(1)
+        decoder_out = decoder_out[
+            :, :, max_ref_len : max_ref_len + orig_target_len
+        ].transpose(1, 2)
+        gnoise = gnoise_target[:, :orig_target_len, :]
 
         # mu for prior loss: use MAS-aligned mel-space mu if available, else post_encoder_proj
-        mu_prior = mu_y_mel if mu_y_mel is not None else mu_bt[:, :orig_mel_len, :]
+        mu_prior = (
+            mu_y_mel if mu_y_mel is not None else mu_target[:, :orig_target_len, :]
+        )
         return decoder_out, mu_prior, gt_mel_lens, gnoise, dur_loss
 
     def forward(
@@ -298,6 +349,9 @@ class CFMbasedModel(nn.Module):
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
+        ref_mels: torch.Tensor | None = None,
+        ref_mel_lens: torch.Tensor | None = None,
+        speaker_ids: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
     ]:
@@ -306,7 +360,10 @@ class CFMbasedModel(nn.Module):
         Returns:
             tuple: (decoder_out, mu_prior, mel_lens, gnoise, dur_loss or None).
         """
-        return self._forward_unet(text_tokens, text_token_lens, gt_mels, gt_mel_lens)
+        return self._forward_unet(
+            text_tokens, text_token_lens, gt_mels, gt_mel_lens, ref_mels, ref_mel_lens,
+            speaker_ids=speaker_ids,
+        )
 
     # ------------------------------------------------------------------
     # Inference
@@ -346,6 +403,9 @@ class CFMbasedModel(nn.Module):
         mel_lens: torch.Tensor | None = None,
         n_timesteps: int = 3,
         length_scale: float = 1.0,
+        ref_mels: torch.Tensor | None = None,
+        ref_mel_lens: torch.Tensor | None = None,
+        speaker_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate mel spectrograms from text via Euler ODE solver.
 
@@ -355,6 +415,9 @@ class CFMbasedModel(nn.Module):
             mel_lens: Target mel lengths (batch_size,). If None, predicted by duration predictor.
             n_timesteps: Number of Euler steps.
             length_scale: Duration scaling factor (inference only).
+            ref_mels: Reference mel spectrograms for speaker conditioning (batch_size, ref_mel_len, nmels).
+            ref_mel_lens: Reference mel lengths (batch_size,).
+            speaker_ids: Speaker ID indices for speaker_id conditioning (batch_size,).
 
         Returns:
             Tuple of (generated_mels, mel_lens).
@@ -375,26 +438,67 @@ class CFMbasedModel(nn.Module):
             aligned_enc = self.upsample(text_encoded, text_token_lens, mel_lens)
 
         max_mel_len = int(mel_lens.max().item())
-
         assert isinstance(self.decoder, ResNet1DUNet)
         nmels = self.decoder.out_channels
-        fixed_len = self._fix_len(max_mel_len)
 
-        mu = self.post_encoder_proj(self._pad_to_len(aligned_enc, fixed_len)).transpose(
-            1, 2
+        # Speaker embedding for speaker_id mode
+        spk_emb = None
+        if self.speaker_conditioning == "speaker_id" and speaker_ids is not None:
+            spk_emb = self.speaker_embedding(speaker_ids)
+
+        use_ref = self.speaker_conditioning == "ref_mel" and ref_mels is not None and ref_mel_lens is not None
+        if use_ref:
+            assert ref_mels is not None and ref_mel_lens is not None
+            ref_mels = self._normalize(ref_mels)
+            max_ref_len = int(ref_mel_lens.max().item())
+            ref_mels_trimmed = ref_mels[:, :max_ref_len, :]
+            total_len = max_ref_len + max_mel_len
+            total_lens = ref_mel_lens + mel_lens
+        else:
+            max_ref_len = 0
+            total_len = max_mel_len
+            total_lens = mel_lens
+
+        fixed_len = self._fix_len(total_len)
+
+        # Build mu
+        mu_target = self.post_encoder_proj(
+            self._pad_to_len(aligned_enc, fixed_len - max_ref_len)
         )
+        if use_ref:
+            mu_ref = self._pad_to_len(ref_mels_trimmed, max_ref_len)
+            mu = torch.cat([mu_ref, mu_target], dim=1)[:, :fixed_len, :].transpose(1, 2)
+        else:
+            mu = mu_target[:, :fixed_len, :].transpose(1, 2)
 
-        mask = self._make_mask(mel_lens, max_len=fixed_len)
-        x = torch.randn(batch_size, nmels, fixed_len, device=text_tokens.device)
+        mask = self._make_mask(total_lens, max_len=fixed_len)
+
+        # Initialize: ref portion is clean, target portion is noise
+        if use_ref:
+            ref_padded = self._pad_to_len(ref_mels_trimmed, max_ref_len)
+            noise_target = torch.randn(
+                batch_size, nmels, fixed_len - max_ref_len, device=text_tokens.device
+            )
+            x = torch.cat([ref_padded.transpose(1, 2), noise_target], dim=2)
+        else:
+            x = torch.randn(batch_size, nmels, fixed_len, device=text_tokens.device)
 
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=text_tokens.device)
         for step in range(n_timesteps):
             t = t_span[step]
             dt = t_span[step + 1] - t
-            dphi_dt = self.decoder(x, mask, mu, t.expand(batch_size))
-            x = x + dt * dphi_dt
+            dphi_dt = self.decoder(x, mask, mu, t.expand(batch_size), spk_emb=spk_emb)
+            if use_ref:
+                # Only update target portion; keep reference portion unchanged
+                x[:, :, max_ref_len:] = (
+                    x[:, :, max_ref_len:] + dt * dphi_dt[:, :, max_ref_len:]
+                )
+            else:
+                x = x + dt * dphi_dt
 
-        return self._denormalize(x[:, :, :max_mel_len].transpose(1, 2)), mel_lens
+        # Extract target portion
+        target_out = x[:, :, max_ref_len : max_ref_len + max_mel_len].transpose(1, 2)
+        return self._denormalize(target_out), mel_lens
 
     # ------------------------------------------------------------------
     # Loss
@@ -406,10 +510,17 @@ class CFMbasedModel(nn.Module):
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
+        ref_mels: torch.Tensor | None = None,
+        ref_mel_lens: torch.Tensor | None = None,
+        speaker_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         gt_mels = self._normalize(gt_mels)
+        if ref_mels is not None:
+            ref_mels = self._normalize(ref_mels)
+
         decoder_out, mu_prior, gt_mel_lens, gnoise, dur_loss = self.forward(
-            text_tokens, text_token_lens, gt_mels, gt_mel_lens
+            text_tokens, text_token_lens, gt_mels, gt_mel_lens, ref_mels, ref_mel_lens,
+            speaker_ids=speaker_ids,
         )
         s = self.sigma_min
         target = gt_mels - (1 - s) * gnoise
