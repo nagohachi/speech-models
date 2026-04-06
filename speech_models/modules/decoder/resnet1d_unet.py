@@ -146,6 +146,7 @@ class ResNet1DUNet(nn.Module):
         in_channels: int,
         out_channels: int,
         channels: tuple[int, ...] = (256, 256),
+        num_res_blocks: int = 1,
         num_mid_blocks: int = 2,
         n_transformer_blocks: int = 0,
         num_heads: int = 4,
@@ -175,7 +176,9 @@ class ResNet1DUNet(nn.Module):
         ch_in = in_channels * 2  # x and mu are concatenated
         for i, ch_out in enumerate(channels):
             is_last = i == len(channels) - 1
-            resnet = ResnetBlock1D(ch_in, ch_out, time_emb_dim)
+            resnets = nn.ModuleList()
+            for j in range(num_res_blocks):
+                resnets.append(ResnetBlock1D(ch_in if j == 0 else ch_out, ch_out, time_emb_dim))
             transformer = self._make_transformer_blocks(
                 ch_out, time_emb_dim, n_transformer_blocks, num_heads, ff_mult, dropout
             )
@@ -184,7 +187,7 @@ class ResNet1DUNet(nn.Module):
                 if not is_last
                 else nn.Conv1d(ch_out, ch_out, 3, padding=1)
             )
-            self.down_blocks.append(nn.ModuleList([resnet, transformer, downsample]))
+            self.down_blocks.append(nn.ModuleList([resnets, transformer, downsample]))
             ch_in = ch_out
 
         # mid blocks
@@ -203,7 +206,9 @@ class ResNet1DUNet(nn.Module):
             ch_in_up = reversed_channels[i] * 2  # skip connection doubles channels
             ch_out_up = reversed_channels[i + 1]
             is_last = i == len(reversed_channels) - 2
-            resnet = ResnetBlock1D(ch_in_up, ch_out_up, time_emb_dim)
+            resnets = nn.ModuleList()
+            for j in range(num_res_blocks):
+                resnets.append(ResnetBlock1D(ch_in_up if j == 0 else ch_out_up, ch_out_up, time_emb_dim))
             transformer = self._make_transformer_blocks(
                 ch_out_up, time_emb_dim, n_transformer_blocks, num_heads, ff_mult, dropout
             )
@@ -212,7 +217,7 @@ class ResNet1DUNet(nn.Module):
                 if not is_last
                 else nn.Conv1d(ch_out_up, ch_out_up, 3, padding=1)
             )
-            self.up_blocks.append(nn.ModuleList([resnet, transformer, upsample]))
+            self.up_blocks.append(nn.ModuleList([resnets, transformer, upsample]))
 
         # final projection
         self.final_block = Block1D(channels[0], channels[0])
@@ -269,9 +274,10 @@ class ResNet1DUNet(nn.Module):
         # down
         hiddens = []
         masks = [mask]
-        for resnet, transformer_blocks, downsample in self.down_blocks:  # type: ignore[misc]
+        for resnets, transformer_blocks, downsample in self.down_blocks:  # type: ignore[misc]
             mask_down = masks[-1]
-            x = resnet(x, mask_down, t_emb)
+            for resnet in resnets:
+                x = resnet(x, mask_down, t_emb)
             for transformer_block in transformer_blocks:
                 x = transformer_block(x, mask_down, t_emb)
             hiddens.append(x)
@@ -287,12 +293,13 @@ class ResNet1DUNet(nn.Module):
                 x = transformer_block(x, mask_mid, t_emb)
 
         # up
-        for resnet, transformer_blocks, upsample in self.up_blocks:  # type: ignore[misc]
+        for resnets, transformer_blocks, upsample in self.up_blocks:  # type: ignore[misc]
             mask_up = masks.pop()
             skip = hiddens.pop()
             x = x[..., : skip.shape[-1]]  # trim if upsample overshot (odd lengths)
             x = torch.cat([x, skip], dim=1)  # skip connection
-            x = resnet(x, mask_up, t_emb)
+            for resnet in resnets:
+                x = resnet(x, mask_up, t_emb)
             for transformer_block in transformer_blocks:
                 x = transformer_block(x, mask_up, t_emb)
             x = upsample(x * mask_up)
