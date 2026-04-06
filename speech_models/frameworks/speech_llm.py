@@ -63,6 +63,8 @@ class SpeechLLM(nn.Module):
             projector_choice = c["projector"]
             projector_conf = c.get("projector_conf", {})
             self.max_new_tokens: int = c.get("max_new_tokens", 256)
+            self.label_smoothing: float = c.get("label_smoothing", 0.0)
+            self.length_normalized_loss: bool = c.get("length_normalized_loss", False)
 
         # --- Whisper encoder (frozen) ---
         whisper_model = whisper.load_model(whisper_name)
@@ -290,11 +292,8 @@ class SpeechLLM(nn.Module):
     ) -> torch.Tensor:
         """Compute cross-entropy loss on the text (assistant) portion only.
 
-        An EOS token (``<|eot_id|>`` for Llama-3 Instruct) is appended to each
-        label so that the model learns when to stop generating.  Labels are
-        passed directly to the LLM so that HuggingFace can use its internal
-        chunked cross-entropy, avoiding materialisation of the full
-        ``(B, L, vocab_size)`` logits tensor.
+        Supports label smoothing and length-normalized loss (per-token average
+        instead of per-batch average).
         """
         # --- Append EOS to label tokens (cf. ESPnet add_sos_eos) ---
         B, T = label_tokens.shape
@@ -313,9 +312,26 @@ class SpeechLLM(nn.Module):
         outputs = self.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            labels=labels,
         )
-        return outputs.loss
+        logits = outputs.logits
+
+        # Shifted cross-entropy with label smoothing
+        shift_logits = logits[:, :-1].contiguous().float()
+        shift_labels = labels[:, 1:].contiguous()
+
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            label_smoothing=self.label_smoothing,
+            reduction="sum" if self.length_normalized_loss else "mean",
+        )
+
+        if self.length_normalized_loss:
+            num_tokens = (shift_labels != -100).sum()
+            loss = loss / num_tokens
+
+        return loss
 
     # ------------------------------------------------------------------
     # Inference
