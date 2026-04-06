@@ -151,6 +151,7 @@ class ResNet1DUNet(nn.Module):
         num_heads: int = 4,
         ff_mult: int = 1,
         dropout: float = 0.05,
+        spk_emb_dim: int = 0,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -164,6 +165,10 @@ class ResNet1DUNet(nn.Module):
             hidden_size=in_channels, output_size=channels[0] * 4
         )
         time_emb_dim = channels[0] * 4
+
+        # speaker embedding projection (fused into time_emb)
+        if spk_emb_dim > 0:
+            self.spk_proj = nn.Linear(spk_emb_dim, time_emb_dim)
 
         # down blocks
         self.down_blocks = nn.ModuleList()
@@ -241,6 +246,7 @@ class ResNet1DUNet(nn.Module):
         mask: torch.Tensor,
         mu: torch.Tensor,
         t: torch.Tensor,
+        spk_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -249,11 +255,14 @@ class ResNet1DUNet(nn.Module):
             mask (torch.Tensor): Padding mask of shape (batch_size, 1, time). 1=valid, 0=pad.
             mu (torch.Tensor): Encoder output of shape (batch_size, in_channels, time).
             t (torch.Tensor): Timestep of shape (batch_size,).
+            spk_emb (torch.Tensor | None): Speaker embedding of shape (batch_size, spk_emb_dim).
 
         Returns:
             torch.Tensor: Predicted velocity of shape (batch_size, out_channels, time).
         """
         t_emb = self.time_embeddings(t)
+        if spk_emb is not None and hasattr(self, "spk_proj"):
+            t_emb = t_emb + self.spk_proj(spk_emb)
 
         x = torch.cat([x, mu], dim=1)  # (B, 2*in_channels, T)
 
