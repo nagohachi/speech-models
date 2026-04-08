@@ -14,6 +14,7 @@ from speech_models.modules.others.tts.alignment import (
 )
 from speech_models.modules.others.tts.duration_predictor import DurationPredictor
 from speech_models.modules.utils.mask import lens_to_mask
+from speech_models.modules.utils.positional_encoding import SinusoidalPositionalEncoding
 from speech_models.tokenizers import BPETokenizer, CharTokenizer
 
 encoder_choices = dict(transformer=TransformerEncoder)
@@ -85,7 +86,6 @@ class CFMbasedModel(nn.Module):
             self.duration_predictor = DurationPredictor(
                 in_channels=enc_hidden, **dp_conf
             )
-            self.proj_mu = nn.Linear(enc_hidden, nmels)
 
         # noise decoder
         self.decoder = decoder_choices[decoder_choice](**decoder_conf)
@@ -99,9 +99,15 @@ class CFMbasedModel(nn.Module):
             padding_idx=tokenizer.pad_token_id,
         )
 
-        # projection layers
+        self.text_positional_encoding = SinusoidalPositionalEncoding(
+            hidden_size=text_emb_dim, dropout_prob=0.0
+        )
+
+        # Single shared encoder->mel projection (Matcha-TTS style).
+        # Used by MAS log-prior, prior loss, AND decoder mu conditioning so
+        # the same tensor is rectified by every loss path.
         if self.use_unet:
-            self.post_encoder_proj = nn.Linear(enc_hidden, nmels)
+            self.proj_m = nn.Linear(enc_hidden, nmels)
         else:
             raise NotImplementedError()
 
@@ -166,9 +172,7 @@ class CFMbasedModel(nn.Module):
     # Speaker conditioning helpers (Matcha-TTS style: channel concat)
     # ------------------------------------------------------------------
 
-    def _lookup_spk_emb(
-        self, speaker_ids: torch.Tensor | None
-    ) -> torch.Tensor | None:
+    def _lookup_spk_emb(self, speaker_ids: torch.Tensor | None) -> torch.Tensor | None:
         """Look up dense speaker embedding from ids.
 
         Returns None when not in speaker_id mode or no speaker_embedding exists.
@@ -236,27 +240,26 @@ class CFMbasedModel(nn.Module):
 
     def _align_with_mas(
         self,
+        mu_x: torch.Tensor,
         text_encoded: torch.Tensor,
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Align encoder output to mel length using MAS + duration predictor.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Align mel-space encoder output to mel length using MAS + duration predictor.
 
         Args:
-            text_encoded: (B, T_text, enc_hidden).
+            mu_x: (B, T_text, nmels), encoder output projected to mel space via proj_m.
+            text_encoded: (B, T_text, enc_hidden), used as duration predictor input only.
             text_token_lens: (B,).
             gt_mels: (B, T_mel, nmels), normalized.
             gt_mel_lens: (B,).
 
         Returns:
-            aligned_enc: (B, T_mel, enc_hidden).
-            mu_y_mel: (B, T_mel, nmels) for prior loss.
+            aligned_mu: (B, T_mel, nmels) — same tensor used for both decoder mu
+                conditioning and prior loss (Matcha-TTS style).
             dur_loss: scalar.
         """
-        # project encoder output to mel space for MAS
-        mu_x = self.proj_mu(text_encoded)  # (B, T_text, nmels)
-
         # masks
         x_mask = self._validity_mask(text_token_lens)  # (B, T_text)
         max_mel_len = int(gt_mel_lens.max().item())
@@ -279,33 +282,33 @@ class CFMbasedModel(nn.Module):
             attn = maximum_path(log_prior, attn_mask)  # (B, T_text, T_mel)
             attn = attn.detach()
 
-        # duration predictor loss
+        # duration predictor loss (DP receives full encoder hidden, detached)
         logw_target = torch.log(1e-8 + attn.sum(-1)) * x_mask  # (B, T_text)
         logw = self.duration_predictor(text_encoded.detach(), x_mask)  # (B, T_text)
         d_loss = duration_loss(logw, logw_target, text_token_lens)
 
-        # align encoder output using MAS alignment
-        # attn: (B, T_text, T_mel), text_encoded: (B, T_text, enc_hidden)
-        aligned_enc = torch.matmul(
-            attn.transpose(1, 2), text_encoded
-        )  # (B, T_mel, enc_hidden)
-        mu_y_mel = torch.matmul(attn.transpose(1, 2), mu_x)  # (B, T_mel, nmels)
+        # align mel-space encoder output using MAS alignment
+        aligned_mu = torch.matmul(attn.transpose(1, 2), mu_x)  # (B, T_mel, nmels)
 
-        return aligned_enc, mu_y_mel, d_loss
+        return aligned_mu, d_loss
 
-    def _get_aligned_enc(
+    def _get_aligned_mu(
         self,
+        mu_x: torch.Tensor,
         text_encoded: torch.Tensor,
         text_token_lens: torch.Tensor,
         gt_mels: torch.Tensor,
         gt_mel_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Get mel-aligned encoder output. Returns (aligned_enc, mu_y_mel, dur_loss)."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Get mel-aligned mel-space encoder output. Returns (aligned_mu, dur_loss).
+
+        aligned_mu: (B, T_mel, nmels) — used for both decoder mu input and prior loss.
+        """
         if self.use_duration_predictor:
             return self._align_with_mas(
-                text_encoded, text_token_lens, gt_mels, gt_mel_lens
+                mu_x, text_encoded, text_token_lens, gt_mels, gt_mel_lens
             )
-        return self.upsample(text_encoded, text_token_lens, gt_mel_lens), None, None
+        return self.upsample(mu_x, text_token_lens, gt_mel_lens), None
 
     # ------------------------------------------------------------------
     # Forward (training)
@@ -332,15 +335,26 @@ class CFMbasedModel(nn.Module):
         spk_emb = self._lookup_spk_emb(speaker_ids)  # (B, spk_emb_dim) or None
 
         text_embeds = self.embedding(text_tokens)
+        text_embeds = self.text_positional_encoding(text_embeds)
         text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
 
-        aligned_enc, mu_y_mel, dur_loss = self._get_aligned_enc(
-            text_encoded, text_token_lens, gt_mels, gt_mel_lens
+        # Project encoder output to mel space ONCE. This single tensor is used
+        # for MAS, prior loss, and decoder mu conditioning (Matcha-TTS style).
+        # Mask padded text positions so they cannot leak into the MAS log-prior.
+        mu_x = self.proj_m(text_encoded)  # (B, T_text, nmels)
+        mu_x = mu_x * self._validity_mask(text_token_lens).unsqueeze(-1)
+
+        aligned_mu, dur_loss = self._get_aligned_mu(
+            mu_x, text_encoded, text_token_lens, gt_mels, gt_mel_lens
         )
 
         # Determine total length with optional reference mel prefix
-        use_ref = self.speaker_conditioning == "ref_mel" and ref_mels is not None and ref_mel_lens is not None
+        use_ref = (
+            self.speaker_conditioning == "ref_mel"
+            and ref_mels is not None
+            and ref_mel_lens is not None
+        )
         if use_ref:
             assert ref_mels is not None and ref_mel_lens is not None
             max_ref_len = int(ref_mel_lens.max().item())
@@ -354,10 +368,9 @@ class CFMbasedModel(nn.Module):
 
         fixed_len = self._fix_len(total_mel_len)
 
-        # Build mu: [ref_mel | post_encoder_proj(aligned_enc)] -> (B, T_total, nmels)
-        mu_target = self.post_encoder_proj(
-            self._pad_to_len(aligned_enc, fixed_len - max_ref_len)
-        )
+        # Build mu: [ref_mel | aligned_mu] -> (B, T_total, nmels). aligned_mu is
+        # already in mel space, so no extra projection is needed.
+        mu_target = self._pad_to_len(aligned_mu, fixed_len - max_ref_len)
         if use_ref:
             mu_ref = self._pad_to_len(ref_mels_trimmed, max_ref_len)
             mu_bt = torch.cat([mu_ref, mu_target], dim=1)[:, :fixed_len, :]
@@ -389,10 +402,9 @@ class CFMbasedModel(nn.Module):
         ].transpose(1, 2)
         gnoise = gnoise_target[:, :orig_target_len, :]
 
-        # mu for prior loss: use MAS-aligned mel-space mu if available, else post_encoder_proj
-        mu_prior = (
-            mu_y_mel if mu_y_mel is not None else mu_target[:, :orig_target_len, :]
-        )
+        # mu for prior loss is exactly the (unpadded) target portion of the mu
+        # the decoder consumed -- single tensor, single source of truth.
+        mu_prior = mu_target[:, :orig_target_len, :]
         return decoder_out, mu_prior, gt_mel_lens, gnoise, dur_loss
 
     def forward(
@@ -413,7 +425,12 @@ class CFMbasedModel(nn.Module):
             tuple: (decoder_out, mu_prior, mel_lens, gnoise, dur_loss or None).
         """
         return self._forward_unet(
-            text_tokens, text_token_lens, gt_mels, gt_mel_lens, ref_mels, ref_mel_lens,
+            text_tokens,
+            text_token_lens,
+            gt_mels,
+            gt_mel_lens,
+            ref_mels,
+            ref_mel_lens,
             speaker_ids=speaker_ids,
         )
 
@@ -423,14 +440,19 @@ class CFMbasedModel(nn.Module):
 
     def _predict_durations(
         self,
+        mu_x: torch.Tensor,
         text_encoded: torch.Tensor,
         text_token_lens: torch.Tensor,
         length_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict mel lengths and aligned encoder output from duration predictor.
+        """Predict mel lengths and aligned mel-space encoder output via DP.
+
+        Args:
+            mu_x: (B, T_text, nmels), encoder output projected to mel space via proj_m.
+            text_encoded: (B, T_text, enc_hidden), used as duration predictor input only.
 
         Returns:
-            aligned_enc: (B, T_mel, enc_hidden).
+            aligned_mu: (B, T_mel, nmels).
             mel_lens: (B,).
         """
         x_mask = self._validity_mask(text_token_lens)  # (B, T_text)
@@ -443,9 +465,9 @@ class CFMbasedModel(nn.Module):
         y_mask = self._validity_mask(mel_lens, max_len=max_mel_len)
         attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(1)
         attn = generate_path(w_ceil, attn_mask)
-        aligned_enc = torch.matmul(attn.transpose(1, 2), text_encoded)
+        aligned_mu = torch.matmul(attn.transpose(1, 2), mu_x)
 
-        return aligned_enc, mel_lens
+        return aligned_mu, mel_lens
 
     @torch.inference_mode()
     def inference_forward(
@@ -480,24 +502,35 @@ class CFMbasedModel(nn.Module):
         spk_emb = self._lookup_spk_emb(speaker_ids)  # (B, spk_emb_dim) or None
 
         text_embeds = self.embedding(text_tokens)
+        text_embeds = self.text_positional_encoding(text_embeds)
         text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
         batch_size = text_tokens.size(0)
 
-        # get aligned encoder output
+        # Project encoder output to mel space ONCE (Matcha-TTS style).
+        # Mask padded text positions so they cannot leak into duration prediction
+        # or the upsampling matmul.
+        mu_x = self.proj_m(text_encoded)  # (B, T_text, nmels)
+        mu_x = mu_x * self._validity_mask(text_token_lens).unsqueeze(-1)
+
+        # get aligned mel-space encoder output
         if self.use_duration_predictor and mel_lens is None:
-            aligned_enc, mel_lens = self._predict_durations(
-                text_encoded, text_token_lens, length_scale
+            aligned_mu, mel_lens = self._predict_durations(
+                mu_x, text_encoded, text_token_lens, length_scale
             )
         else:
             assert mel_lens is not None
-            aligned_enc = self.upsample(text_encoded, text_token_lens, mel_lens)
+            aligned_mu = self.upsample(mu_x, text_token_lens, mel_lens)
 
         max_mel_len = int(mel_lens.max().item())
         assert isinstance(self.decoder, ResNet1DUNet)
         nmels = self.decoder.out_channels
 
-        use_ref = self.speaker_conditioning == "ref_mel" and ref_mels is not None and ref_mel_lens is not None
+        use_ref = (
+            self.speaker_conditioning == "ref_mel"
+            and ref_mels is not None
+            and ref_mel_lens is not None
+        )
         if use_ref:
             assert ref_mels is not None and ref_mel_lens is not None
             ref_mels = self._normalize(ref_mels)
@@ -512,10 +545,8 @@ class CFMbasedModel(nn.Module):
 
         fixed_len = self._fix_len(total_len)
 
-        # Build mu
-        mu_target = self.post_encoder_proj(
-            self._pad_to_len(aligned_enc, fixed_len - max_ref_len)
-        )
+        # Build mu (aligned_mu is already in mel space; no extra projection needed)
+        mu_target = self._pad_to_len(aligned_mu, fixed_len - max_ref_len)
         if use_ref:
             mu_ref = self._pad_to_len(ref_mels_trimmed, max_ref_len)
             mu = torch.cat([mu_ref, mu_target], dim=1)[:, :fixed_len, :].transpose(1, 2)
@@ -570,7 +601,12 @@ class CFMbasedModel(nn.Module):
             ref_mels = self._normalize(ref_mels)
 
         decoder_out, mu_prior, gt_mel_lens, gnoise, dur_loss = self.forward(
-            text_tokens, text_token_lens, gt_mels, gt_mel_lens, ref_mels, ref_mel_lens,
+            text_tokens,
+            text_token_lens,
+            gt_mels,
+            gt_mel_lens,
+            ref_mels,
+            ref_mel_lens,
             speaker_ids=speaker_ids,
         )
         s = self.sigma_min

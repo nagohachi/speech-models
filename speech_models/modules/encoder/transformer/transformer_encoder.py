@@ -4,6 +4,15 @@ from speech_models.modules.utils.mask import lens_to_mask
 
 
 class TransformerEncoder(nn.Module):
+    """Generic transformer encoder.
+
+    NOTE: This encoder does NOT add positional encoding. The caller is
+    responsible for adding PE to the input embedding (or for using a
+    PE-equivariant downstream loss). Keeping PE out of the encoder lets
+    different consumers pick their own scheme (sinusoidal, learned, RoPE, etc.)
+    or none at all.
+    """
+
     def __init__(
         self,
         hidden_size: int,
