@@ -167,13 +167,12 @@ class ResNet1DUNet(nn.Module):
         )
         time_emb_dim = channels[0] * 4
 
-        # speaker embedding projection (fused into time_emb)
-        if spk_emb_dim > 0:
-            self.spk_proj = nn.Linear(spk_emb_dim, time_emb_dim)
+        # speaker conditioning is via channel concat at the input (Matcha-TTS style)
+        self.spk_emb_dim = spk_emb_dim
 
         # down blocks
         self.down_blocks = nn.ModuleList()
-        ch_in = in_channels * 2  # x and mu are concatenated
+        ch_in = in_channels * 2 + spk_emb_dim  # x, mu, (optional) spk concatenated
         for i, ch_out in enumerate(channels):
             is_last = i == len(channels) - 1
             resnets = nn.ModuleList()
@@ -266,10 +265,12 @@ class ResNet1DUNet(nn.Module):
             torch.Tensor: Predicted velocity of shape (batch_size, out_channels, time).
         """
         t_emb = self.time_embeddings(t)
-        if spk_emb is not None and hasattr(self, "spk_proj"):
-            t_emb = t_emb + self.spk_proj(spk_emb)
 
-        x = torch.cat([x, mu], dim=1)  # (B, 2*in_channels, T)
+        if spk_emb is not None:
+            spk_t = spk_emb.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+            x = torch.cat([x, mu, spk_t], dim=1)  # (B, 2*in_channels + spk_emb_dim, T)
+        else:
+            x = torch.cat([x, mu], dim=1)  # (B, 2*in_channels, T)
 
         # down
         hiddens = []

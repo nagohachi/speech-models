@@ -41,11 +41,11 @@ class CFMbasedModel(nn.Module):
         with open(encoder_config_path, "r") as f:
             enc_cfg = yaml.safe_load(f)
             encoder_choice = enc_cfg["encoder"]
-            encoder_conf = enc_cfg["encoder_conf"]
+            encoder_conf = dict(enc_cfg["encoder_conf"])
         with open(decoder_config_path, "r") as f:
             c = yaml.safe_load(f)
             decoder_choice = c["decoder"]
-            decoder_conf = c["decoder_conf"]
+            decoder_conf = dict(c["decoder_conf"])
 
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.vocab_size
@@ -54,11 +54,31 @@ class CFMbasedModel(nn.Module):
         self.nmels = nmels
         self.speaker_conditioning = speaker_conditioning
 
-        # text encoder
+        # text embedding dim before any speaker bump (Matcha-TTS style: encoder
+        # operates at text_emb_dim + spk_emb_dim, but the text token embedding
+        # itself stays at text_emb_dim and speaker info is concat-broadcast)
+        text_emb_dim: int = encoder_conf["hidden_size"]
+
+        # speaker embedding (only for speaker_id conditioning)
+        # NOTE: created BEFORE the encoder so we can bump the encoder hidden_size.
+        if speaker_conditioning == "speaker_id" and num_speakers > 0:
+            self.speaker_embedding = nn.Embedding(num_speakers, speaker_emb_dim)
+            encoder_conf["hidden_size"] = text_emb_dim + speaker_emb_dim
+            decoder_conf["spk_emb_dim"] = speaker_emb_dim
+            num_heads = encoder_conf.get("num_heads")
+            if num_heads is not None and encoder_conf["hidden_size"] % num_heads != 0:
+                raise ValueError(
+                    f"encoder hidden_size ({encoder_conf['hidden_size']} = "
+                    f"{text_emb_dim} + {speaker_emb_dim}) must be divisible by "
+                    f"num_heads ({num_heads}) for speaker_id conditioning"
+                )
+
+        # text encoder (operates at text_emb_dim + spk_emb_dim if speaker_id mode)
         self.encoder = encoder_choices[encoder_choice](**encoder_conf)
         enc_hidden: int = self.encoder.hidden_size
 
-        # duration predictor (optional)
+        # duration predictor (optional). in_channels is enc_hidden so it is
+        # automatically speaker-aware in speaker_id mode.
         self.use_duration_predictor = enc_cfg.get("use_duration_predictor", False)
         if self.use_duration_predictor:
             dp_conf = enc_cfg.get("duration_predictor_conf", {})
@@ -67,19 +87,15 @@ class CFMbasedModel(nn.Module):
             )
             self.proj_mu = nn.Linear(enc_hidden, nmels)
 
-        # speaker embedding (only for speaker_id conditioning)
-        if speaker_conditioning == "speaker_id" and num_speakers > 0:
-            self.speaker_embedding = nn.Embedding(num_speakers, speaker_emb_dim)
-            decoder_conf["spk_emb_dim"] = speaker_emb_dim
-
         # noise decoder
         self.decoder = decoder_choices[decoder_choice](**decoder_conf)
         self.use_unet = isinstance(self.decoder, ResNet1DUNet)
 
-        # text embedding
+        # text embedding (kept at text_emb_dim; speaker info is concat-broadcast
+        # to its output before being fed to the encoder)
         self.embedding = nn.Embedding(
             num_embeddings=self.vocab_size,
-            embedding_dim=enc_hidden,
+            embedding_dim=text_emb_dim,
             padding_idx=tokenizer.pad_token_id,
         )
 
@@ -145,6 +161,43 @@ class CFMbasedModel(nn.Module):
         if pad_size > 0:
             return torch.nn.functional.pad(x, (0, 0, 0, pad_size))
         return x
+
+    # ------------------------------------------------------------------
+    # Speaker conditioning helpers (Matcha-TTS style: channel concat)
+    # ------------------------------------------------------------------
+
+    def _lookup_spk_emb(
+        self, speaker_ids: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """Look up dense speaker embedding from ids.
+
+        Returns None when not in speaker_id mode or no speaker_embedding exists.
+        """
+        if (
+            self.speaker_conditioning != "speaker_id"
+            or speaker_ids is None
+            or not hasattr(self, "speaker_embedding")
+        ):
+            return None
+        return self.speaker_embedding(speaker_ids)  # (B, spk_emb_dim)
+
+    def _concat_spk_to_text_embeds(
+        self, text_embeds: torch.Tensor, spk_emb: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Broadcast speaker embedding along time and concat to text embeddings.
+
+        Args:
+            text_embeds: (B, T_text, text_emb_dim).
+            spk_emb: (B, spk_emb_dim) or None.
+
+        Returns:
+            (B, T_text, text_emb_dim + spk_emb_dim) if spk_emb is not None,
+            else text_embeds unchanged.
+        """
+        if spk_emb is None:
+            return text_embeds
+        spk_t = spk_emb.unsqueeze(1).expand(-1, text_embeds.size(1), -1)
+        return torch.cat([text_embeds, spk_t], dim=-1)
 
     # ------------------------------------------------------------------
     # Upsampling: uniform or MAS-based
@@ -275,17 +328,16 @@ class CFMbasedModel(nn.Module):
 
         time_steps = torch.rand(batch_size, device=gt_mels.device)
 
+        # Speaker embedding (looked up once, used for both encoder and decoder)
+        spk_emb = self._lookup_spk_emb(speaker_ids)  # (B, spk_emb_dim) or None
+
         text_embeds = self.embedding(text_tokens)
+        text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
 
         aligned_enc, mu_y_mel, dur_loss = self._get_aligned_enc(
             text_encoded, text_token_lens, gt_mels, gt_mel_lens
         )
-
-        # Speaker embedding for speaker_id mode
-        spk_emb = None
-        if self.speaker_conditioning == "speaker_id" and speaker_ids is not None:
-            spk_emb = self.speaker_embedding(speaker_ids)  # (B, spk_emb_dim)
 
         # Determine total length with optional reference mel prefix
         use_ref = self.speaker_conditioning == "ref_mel" and ref_mels is not None and ref_mel_lens is not None
@@ -424,7 +476,11 @@ class CFMbasedModel(nn.Module):
             generated_mels: (batch_size, max_mel_len, mel_dim).
             mel_lens: (batch_size,).
         """
+        # Speaker embedding (looked up once, used for both encoder and decoder)
+        spk_emb = self._lookup_spk_emb(speaker_ids)  # (B, spk_emb_dim) or None
+
         text_embeds = self.embedding(text_tokens)
+        text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
         text_encoded, _ = self.encoder(text_embeds, text_token_lens)
         batch_size = text_tokens.size(0)
 
@@ -440,11 +496,6 @@ class CFMbasedModel(nn.Module):
         max_mel_len = int(mel_lens.max().item())
         assert isinstance(self.decoder, ResNet1DUNet)
         nmels = self.decoder.out_channels
-
-        # Speaker embedding for speaker_id mode
-        spk_emb = None
-        if self.speaker_conditioning == "speaker_id" and speaker_ids is not None:
-            spk_emb = self.speaker_embedding(speaker_ids)
 
         use_ref = self.speaker_conditioning == "ref_mel" and ref_mels is not None and ref_mel_lens is not None
         if use_ref:
