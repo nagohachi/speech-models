@@ -6,9 +6,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import whisper
 import yaml
-from speech_models.modules.frontend.whisper_mel import WhisperFrontend
+from speech_models.modules.encoder.wavlm.wavlm_encoder import WavLMEncoder
+from speech_models.modules.encoder.whisper.whisper_encoder import WhisperEncoder
+from speech_models.modules.frontend.huggingface_frontend import HuggingFaceFrontend
+from speech_models.modules.frontend.whisper_frontend import WhisperFrontend
 from speech_models.modules.others.speech_llm.projector import (
     ConvProjector,
     LinearProjector,
@@ -16,65 +18,98 @@ from speech_models.modules.others.speech_llm.projector import (
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+frontend_choices = dict(
+    whisper_mel=WhisperFrontend,
+    huggingface=HuggingFaceFrontend,
+)
+encoder_choices = dict(
+    whisper=WhisperEncoder,
+    wavlm=WavLMEncoder,
+)
 projector_choices = dict(linear=LinearProjector, mlp=MLPProjector, conv=ConvProjector)
 
 SPEECH_PLACEHOLDER = "{speech}"
 
 
 class SpeechLLM(nn.Module):
-    """Speech LLM with Whisper encoder (frozen) -> Projector -> LLM.
+    """Speech LLM with a pluggable speech encoder -> Projector -> LLM.
 
-    The Whisper encoder extracts speech features, the projector maps them to the
-    LLM embedding space, and a chat-template prompt wraps the features::
+    The speech encoder (frozen by default) extracts features, the projector
+    maps them to the LLM embedding space, and a chat-template prompt wraps the
+    features::
 
         [prefix_tokens, speech_embeds, postfix_tokens, target_tokens]
 
-    The ``prompt`` parameter is a user-role message containing ``{speech}`` as a
-    placeholder.  It is formatted through ``tokenizer.apply_chat_template`` so
-    that the model receives proper role / modality markers.
+    The frontend / encoder pair is chosen via separate yaml files following
+    the same convention as ``CTCBasedASR`` (``frontend:``+``frontend_conf:``
+    and ``encoder:``+``encoder_conf:``). The LLM, projector, prompt template,
+    LoRA config and loss-related hyperparameters live in a third yaml file
+    (``speech_llm_config_path``).
 
-    Example config::
+    Example frontend yaml::
 
+        frontend: whisper_mel
+        frontend_conf:
+          n_mels: 128
+
+    Example encoder yaml::
+
+        encoder: whisper
+        encoder_conf:
+          name: large-v3
+          freeze: true
+
+    Example speech_llm yaml::
+
+        llm_name_or_path: meta-llama/Llama-3.2-3B-Instruct
+        freeze_llm: true
         prompt: "Transcribe the following audio.\\n{speech}"
+        projector: mlp
+        projector_conf:
+          output_dim: 3072
+          hidden_dim: 3072
+          downsample_k: 3
 
-    For Llama-3.2-Instruct this produces::
-
-        <|begin_of_text|><|start_header_id|>user<|end_header_id|>
-
-        Transcribe the following audio.
-        [SPEECH]<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-    LoRA can be applied to the LLM for parameter-efficient fine-tuning.
+    The ``projector_conf.input_dim`` is auto-filled from
+    ``encoder.hidden_size`` if omitted; if both are set and disagree a
+    ``ValueError`` is raised.
     """
 
     def __init__(
         self,
-        projector_config_path: Path | str,
-        whisper_name: str = "base",
-        llm_name_or_path: str = "meta-llama/Llama-3.2-1B",
-        freeze_llm: bool = True,
-        prompt: str | None = None,
-        lora_config: dict[str, Any] | None = None,
+        frontend_config_path: Path | str,
+        encoder_config_path: Path | str,
+        speech_llm_config_path: Path | str,
     ) -> None:
         super().__init__()
 
-        with open(projector_config_path, "r") as f:
+        # --- Frontend ---
+        with open(frontend_config_path, "r") as f:
             c = yaml.safe_load(f)
-            projector_choice = c["projector"]
-            projector_conf = c.get("projector_conf", {})
+            frontend_choice = c["frontend"]
+            frontend_conf = c.get("frontend_conf", {})
+        self.frontend = frontend_choices[frontend_choice](**frontend_conf)
+
+        # --- Speech encoder ---
+        with open(encoder_config_path, "r") as f:
+            c = yaml.safe_load(f)
+            encoder_choice = c["encoder"]
+            encoder_conf = c.get("encoder_conf", {})
+        self.encoder = encoder_choices[encoder_choice](**encoder_conf)
+
+        # --- LLM + projector + prompt ---
+        with open(speech_llm_config_path, "r") as f:
+            c = yaml.safe_load(f)
+            llm_name_or_path: str = c["llm_name_or_path"]
+            freeze_llm: bool = c.get("freeze_llm", True)
+            prompt: str | None = c.get("prompt")
+            lora_config: dict[str, Any] | None = c.get("lora")
+            projector_choice: str = c["projector"]
+            projector_conf: dict[str, Any] = dict(c.get("projector_conf", {}))
             self.max_new_tokens: int = c.get("max_new_tokens", 256)
             self.label_smoothing: float = c.get("label_smoothing", 0.0)
             self.length_normalized_loss: bool = c.get("length_normalized_loss", False)
 
-        # --- Whisper encoder (frozen) ---
-        whisper_model = whisper.load_model(whisper_name)
-        self.frontend = WhisperFrontend(n_mels=whisper_model.dims.n_mels)
-        self.whisper_encoder = whisper_model.encoder
-        self.whisper_encoder.eval()
-        for p in self.whisper_encoder.parameters():
-            p.requires_grad = False
-
-        # --- LLM ---
         self.llm = AutoModelForCausalLM.from_pretrained(llm_name_or_path)
         self.tokenizer = AutoTokenizer.from_pretrained(llm_name_or_path)
         if self.tokenizer.pad_token is None:
@@ -93,7 +128,14 @@ class SpeechLLM(nn.Module):
 
         self.llm.gradient_checkpointing_enable()
 
-        # --- Projector (trainable) ---
+        # --- Projector (trainable), with input_dim auto-fill ---
+        if "input_dim" not in projector_conf:
+            projector_conf["input_dim"] = self.encoder.hidden_size
+        elif projector_conf["input_dim"] != self.encoder.hidden_size:
+            raise ValueError(
+                f"projector_conf.input_dim={projector_conf['input_dim']} does not "
+                f"match encoder.hidden_size={self.encoder.hidden_size}"
+            )
         self.projector = projector_choices[projector_choice](**projector_conf)
         self._has_conv_projector = isinstance(self.projector, ConvProjector)
 
@@ -182,34 +224,28 @@ class SpeechLLM(nn.Module):
         """Encode audio waveforms into LLM-space embeddings.
 
         Args:
-            wavs: (B, samples) audio at 16 kHz.
+            wavs: (B, samples) audio at the encoder's expected sample rate.
             wav_lens: (B,) sample counts.
 
         Returns:
             speech_embeds: (B, T_enc, llm_dim) projected speech features.
             speech_lens: (B,) valid frame counts after encoding + projection.
         """
-        mels, mel_lens = self.frontend(wavs, wav_lens)
-
-        with torch.no_grad():
-            speech_features = self.whisper_encoder(mels)  # (B, 1500, whisper_dim)
-
-        speech_lens = ((mel_lens + 1) / 2).long().clamp(max=speech_features.size(1))
-        speech_embeds = self.projector(speech_features)
+        feats, xlens = self.frontend(wavs, wav_lens)         # (B, T, D_feat)
+        feats, xlens = self.encoder(feats, xlens)            # (B, T_enc, hidden_size)
+        speech_embeds = self.projector(feats)                # (B, T', llm_dim)
 
         if self._has_conv_projector:
             stride = self.projector.stride
-            speech_lens = (
-                ((speech_lens + stride - 1) / stride)
+            xlens = (
+                ((xlens + stride - 1) // stride)
                 .long()
                 .clamp(max=speech_embeds.size(1))
             )
         elif hasattr(self.projector, "ds_k") and self.projector.ds_k > 1:
-            speech_lens = (speech_lens // self.projector.ds_k).clamp(
-                max=speech_embeds.size(1)
-            )
+            xlens = (xlens // self.projector.ds_k).clamp(max=speech_embeds.size(1))
 
-        return speech_embeds, speech_lens
+        return speech_embeds, xlens
 
     # ------------------------------------------------------------------
     # Build full input sequence
