@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 import yaml
 from speech_models.modules.decoder.resnet1d_unet import ResNet1DUNet
-from speech_models.modules.encoder import ConformerEncoder, TransformerEncoder
+from speech_models.modules.encoder import (
+    ConformerEncoder,
+    GlowTTSEncoder,
+    TransformerEncoder,
+)
 from speech_models.modules.others.tts.alignment import (
     duration_loss,
     generate_path,
@@ -17,7 +21,7 @@ from speech_models.modules.utils.mask import lens_to_mask
 from speech_models.modules.utils.positional_encoding import SinusoidalPositionalEncoding
 from speech_models.tokenizers import BPETokenizer, CharTokenizer
 
-encoder_choices = dict(transformer=TransformerEncoder)
+encoder_choices = dict(transformer=TransformerEncoder, glow_tts=GlowTTSEncoder)
 decoder_choices = dict(conformer=ConformerEncoder, resnet1d_unet=ResNet1DUNet)
 
 
@@ -59,23 +63,53 @@ class CFMbasedModel(nn.Module):
         # operates at text_emb_dim + spk_emb_dim, but the text token embedding
         # itself stays at text_emb_dim and speaker info is concat-broadcast)
         text_emb_dim: int = encoder_conf["hidden_size"]
+        self.text_emb_dim = text_emb_dim
+
+        # Look up the encoder class so we can read its preferences BEFORE
+        # constructing it. The class constants tell us:
+        #   - whether to scale the embedding by sqrt(d) at forward
+        #   - whether to add absolute sinusoidal PE
+        #   - how to initialize the embedding weight
+        #   - whether the encoder bundles its own speaker concat (so we should
+        #     pass spk_emb via kwarg instead of pre-concatenating)
+        encoder_class = encoder_choices[encoder_choice]
+        self._scale_embedding: bool = getattr(encoder_class, "WANTS_EMBEDDING_SCALE", False)
+        self._add_absolute_pe: bool = getattr(encoder_class, "WANTS_ABSOLUTE_PE", True)
+        self._embedding_init_style: str = getattr(
+            encoder_class, "EMBEDDING_INIT_STYLE", "default"
+        )
+        self._encoder_handles_spk_concat: bool = getattr(
+            encoder_class, "BUNDLES_SPK_CONCAT", False
+        )
 
         # speaker embedding (only for speaker_id conditioning)
-        # NOTE: created BEFORE the encoder so we can bump the encoder hidden_size.
+        # NOTE: created BEFORE the encoder so we can bump the encoder hidden_size
+        # for the legacy (non-bundling) encoders.
         if speaker_conditioning == "speaker_id" and num_speakers > 0:
             self.speaker_embedding = nn.Embedding(num_speakers, speaker_emb_dim)
-            encoder_conf["hidden_size"] = text_emb_dim + speaker_emb_dim
             decoder_conf["spk_emb_dim"] = speaker_emb_dim
+            if self._encoder_handles_spk_concat:
+                # Encoder accepts spk_emb_dim via its constructor and applies
+                # the concat at the right point internally; do NOT bump
+                # hidden_size on the way in.
+                encoder_conf["spk_emb_dim"] = speaker_emb_dim
+                effective_hidden = text_emb_dim + speaker_emb_dim
+            else:
+                # Legacy path: framework pre-concatenates speaker to the text
+                # stream before calling the encoder, so the encoder's
+                # `hidden_size` parameter must include the speaker dim.
+                encoder_conf["hidden_size"] = text_emb_dim + speaker_emb_dim
+                effective_hidden = encoder_conf["hidden_size"]
             num_heads = encoder_conf.get("num_heads")
-            if num_heads is not None and encoder_conf["hidden_size"] % num_heads != 0:
+            if num_heads is not None and effective_hidden % num_heads != 0:
                 raise ValueError(
-                    f"encoder hidden_size ({encoder_conf['hidden_size']} = "
+                    f"effective encoder hidden_size ({effective_hidden} = "
                     f"{text_emb_dim} + {speaker_emb_dim}) must be divisible by "
                     f"num_heads ({num_heads}) for speaker_id conditioning"
                 )
 
         # text encoder (operates at text_emb_dim + spk_emb_dim if speaker_id mode)
-        self.encoder = encoder_choices[encoder_choice](**encoder_conf)
+        self.encoder = encoder_class(**encoder_conf)
         enc_hidden: int = self.encoder.hidden_size
 
         # duration predictor (optional). in_channels is enc_hidden so it is
@@ -98,16 +132,29 @@ class CFMbasedModel(nn.Module):
             embedding_dim=text_emb_dim,
             padding_idx=tokenizer.pad_token_id,
         )
+        if self._embedding_init_style == "normal_scaled":
+            # Vaswani / Glow-TTS recipe: small embeddings paired with the
+            # `× sqrt(d)` scale at forward (see _forward_unet / inference_forward).
+            nn.init.normal_(self.embedding.weight, 0.0, text_emb_dim**-0.5)
+            with torch.no_grad():
+                self.embedding.weight[tokenizer.pad_token_id].zero_()
 
+        # Sinusoidal absolute PE — only used when the encoder asks for it via
+        # WANTS_ABSOLUTE_PE. Always constructed (cheap; just a buffer) so the
+        # forward path stays simple.
         self.text_positional_encoding = SinusoidalPositionalEncoding(
             hidden_size=text_emb_dim, dropout_prob=0.0
         )
 
         # Single shared encoder->mel projection (Matcha-TTS style).
         # Used by MAS log-prior, prior loss, AND decoder mu conditioning so
-        # the same tensor is rectified by every loss path.
+        # the same tensor is rectified by every loss path. Init follows the
+        # same pattern as the decoder Linear layers (kaiming_normal weight,
+        # zero bias) for parity.
         if self.use_unet:
             self.proj_m = nn.Linear(enc_hidden, nmels)
+            nn.init.kaiming_normal_(self.proj_m.weight, nonlinearity="relu")
+            nn.init.zeros_(self.proj_m.bias)
         else:
             raise NotImplementedError()
 
@@ -335,9 +382,17 @@ class CFMbasedModel(nn.Module):
         spk_emb = self._lookup_spk_emb(speaker_ids)  # (B, spk_emb_dim) or None
 
         text_embeds = self.embedding(text_tokens)
-        text_embeds = self.text_positional_encoding(text_embeds)
-        text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
-        text_encoded, _ = self.encoder(text_embeds, text_token_lens)
+        if self._scale_embedding:
+            text_embeds = text_embeds * math.sqrt(self.text_emb_dim)
+        if self._add_absolute_pe:
+            text_embeds = self.text_positional_encoding(text_embeds)
+        if not self._encoder_handles_spk_concat:
+            text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
+        text_encoded, _ = self.encoder(
+            text_embeds,
+            text_token_lens,
+            spk_emb=spk_emb if self._encoder_handles_spk_concat else None,
+        )
 
         # Project encoder output to mel space ONCE. This single tensor is used
         # for MAS, prior loss, and decoder mu conditioning (Matcha-TTS style).
@@ -355,6 +410,7 @@ class CFMbasedModel(nn.Module):
             and ref_mels is not None
             and ref_mel_lens is not None
         )
+        ref_mels_trimmed: torch.Tensor | None = None
         if use_ref:
             assert ref_mels is not None and ref_mel_lens is not None
             max_ref_len = int(ref_mel_lens.max().item())
@@ -372,6 +428,7 @@ class CFMbasedModel(nn.Module):
         # already in mel space, so no extra projection is needed.
         mu_target = self._pad_to_len(aligned_mu, fixed_len - max_ref_len)
         if use_ref:
+            assert ref_mels_trimmed is not None
             mu_ref = self._pad_to_len(ref_mels_trimmed, max_ref_len)
             mu_bt = torch.cat([mu_ref, mu_target], dim=1)[:, :fixed_len, :]
         else:
@@ -387,6 +444,7 @@ class CFMbasedModel(nn.Module):
         x_t_target = (1 - (1 - s) * t) * gnoise_target + t * gt_mels_padded
 
         if use_ref:
+            assert ref_mels_trimmed is not None
             ref_padded = self._pad_to_len(ref_mels_trimmed, max_ref_len)
             x_t = torch.cat([ref_padded, x_t_target], dim=1).transpose(1, 2)
         else:
@@ -502,9 +560,17 @@ class CFMbasedModel(nn.Module):
         spk_emb = self._lookup_spk_emb(speaker_ids)  # (B, spk_emb_dim) or None
 
         text_embeds = self.embedding(text_tokens)
-        text_embeds = self.text_positional_encoding(text_embeds)
-        text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
-        text_encoded, _ = self.encoder(text_embeds, text_token_lens)
+        if self._scale_embedding:
+            text_embeds = text_embeds * math.sqrt(self.text_emb_dim)
+        if self._add_absolute_pe:
+            text_embeds = self.text_positional_encoding(text_embeds)
+        if not self._encoder_handles_spk_concat:
+            text_embeds = self._concat_spk_to_text_embeds(text_embeds, spk_emb)
+        text_encoded, _ = self.encoder(
+            text_embeds,
+            text_token_lens,
+            spk_emb=spk_emb if self._encoder_handles_spk_concat else None,
+        )
         batch_size = text_tokens.size(0)
 
         # Project encoder output to mel space ONCE (Matcha-TTS style).
@@ -531,6 +597,7 @@ class CFMbasedModel(nn.Module):
             and ref_mels is not None
             and ref_mel_lens is not None
         )
+        ref_mels_trimmed: torch.Tensor | None = None
         if use_ref:
             assert ref_mels is not None and ref_mel_lens is not None
             ref_mels = self._normalize(ref_mels)
@@ -548,6 +615,7 @@ class CFMbasedModel(nn.Module):
         # Build mu (aligned_mu is already in mel space; no extra projection needed)
         mu_target = self._pad_to_len(aligned_mu, fixed_len - max_ref_len)
         if use_ref:
+            assert ref_mels_trimmed is not None
             mu_ref = self._pad_to_len(ref_mels_trimmed, max_ref_len)
             mu = torch.cat([mu_ref, mu_target], dim=1)[:, :fixed_len, :].transpose(1, 2)
         else:
@@ -557,6 +625,7 @@ class CFMbasedModel(nn.Module):
 
         # Initialize: ref portion is clean, target portion is noise
         if use_ref:
+            assert ref_mels_trimmed is not None
             ref_padded = self._pad_to_len(ref_mels_trimmed, max_ref_len)
             noise_target = torch.randn(
                 batch_size, nmels, fixed_len - max_ref_len, device=text_tokens.device

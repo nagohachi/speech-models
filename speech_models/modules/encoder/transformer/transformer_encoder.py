@@ -13,6 +13,14 @@ class TransformerEncoder(nn.Module):
     or none at all.
     """
 
+    # Class-level hints for `CFMbasedModel` (and other consumers) about how to
+    # prepare the input embedding stream. Defaults match the historical
+    # behavior so this encoder is unchanged for ASR / speech-LLM consumers.
+    WANTS_EMBEDDING_SCALE: bool = False
+    WANTS_ABSOLUTE_PE: bool = True
+    EMBEDDING_INIT_STYLE: str = "default"
+    BUNDLES_SPK_CONCAT: bool = False
+
     def __init__(
         self,
         hidden_size: int,
@@ -34,7 +42,10 @@ class TransformerEncoder(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, xlens: torch.Tensor
+        self,
+        x: torch.Tensor,
+        xlens: torch.Tensor,
+        spk_emb: torch.Tensor | None = None,  # noqa: ARG002 - kept for API parity
     ) -> tuple[torch.Tensor, torch.Tensor]:
         mask = lens_to_mask(xlens)
         return self.transformer_encoder(x, src_key_padding_mask=mask), xlens

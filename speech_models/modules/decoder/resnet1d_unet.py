@@ -243,6 +243,17 @@ class ResNet1DUNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # AdaLN-Zero: zero-initialize the AdaLayerNorm projection so that at
+        # init each transformer block degenerates to plain LayerNorm + identity
+        # scale (DiT-style). The time conditioning then grows in safely as the
+        # weights move away from zero.
+        for m in self.modules():
+            if isinstance(m, AdaLayerNorm):
+                nn.init.zeros_(m.linear.weight)
+                nn.init.zeros_(m.linear.bias)
 
     def forward(
         self,
