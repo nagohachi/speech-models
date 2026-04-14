@@ -146,11 +146,13 @@ class ResNet1DUNet(nn.Module):
         in_channels: int,
         out_channels: int,
         channels: tuple[int, ...] = (256, 256),
+        num_res_blocks: int = 1,
         num_mid_blocks: int = 2,
         n_transformer_blocks: int = 0,
         num_heads: int = 4,
         ff_mult: int = 1,
         dropout: float = 0.05,
+        spk_emb_dim: int = 0,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -165,12 +167,17 @@ class ResNet1DUNet(nn.Module):
         )
         time_emb_dim = channels[0] * 4
 
+        # speaker conditioning is via channel concat at the input (Matcha-TTS style)
+        self.spk_emb_dim = spk_emb_dim
+
         # down blocks
         self.down_blocks = nn.ModuleList()
-        ch_in = in_channels * 2  # x and mu are concatenated
+        ch_in = in_channels * 2 + spk_emb_dim  # x, mu, (optional) spk concatenated
         for i, ch_out in enumerate(channels):
             is_last = i == len(channels) - 1
-            resnet = ResnetBlock1D(ch_in, ch_out, time_emb_dim)
+            resnets = nn.ModuleList()
+            for j in range(num_res_blocks):
+                resnets.append(ResnetBlock1D(ch_in if j == 0 else ch_out, ch_out, time_emb_dim))
             transformer = self._make_transformer_blocks(
                 ch_out, time_emb_dim, n_transformer_blocks, num_heads, ff_mult, dropout
             )
@@ -179,7 +186,7 @@ class ResNet1DUNet(nn.Module):
                 if not is_last
                 else nn.Conv1d(ch_out, ch_out, 3, padding=1)
             )
-            self.down_blocks.append(nn.ModuleList([resnet, transformer, downsample]))
+            self.down_blocks.append(nn.ModuleList([resnets, transformer, downsample]))
             ch_in = ch_out
 
         # mid blocks
@@ -198,7 +205,9 @@ class ResNet1DUNet(nn.Module):
             ch_in_up = reversed_channels[i] * 2  # skip connection doubles channels
             ch_out_up = reversed_channels[i + 1]
             is_last = i == len(reversed_channels) - 2
-            resnet = ResnetBlock1D(ch_in_up, ch_out_up, time_emb_dim)
+            resnets = nn.ModuleList()
+            for j in range(num_res_blocks):
+                resnets.append(ResnetBlock1D(ch_in_up if j == 0 else ch_out_up, ch_out_up, time_emb_dim))
             transformer = self._make_transformer_blocks(
                 ch_out_up, time_emb_dim, n_transformer_blocks, num_heads, ff_mult, dropout
             )
@@ -207,7 +216,7 @@ class ResNet1DUNet(nn.Module):
                 if not is_last
                 else nn.Conv1d(ch_out_up, ch_out_up, 3, padding=1)
             )
-            self.up_blocks.append(nn.ModuleList([resnet, transformer, upsample]))
+            self.up_blocks.append(nn.ModuleList([resnets, transformer, upsample]))
 
         # final projection
         self.final_block = Block1D(channels[0], channels[0])
@@ -234,6 +243,17 @@ class ResNet1DUNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # AdaLN-Zero: zero-initialize the AdaLayerNorm projection so that at
+        # init each transformer block degenerates to plain LayerNorm + identity
+        # scale (DiT-style). The time conditioning then grows in safely as the
+        # weights move away from zero.
+        for m in self.modules():
+            if isinstance(m, AdaLayerNorm):
+                nn.init.zeros_(m.linear.weight)
+                nn.init.zeros_(m.linear.bias)
 
     def forward(
         self,
@@ -241,6 +261,7 @@ class ResNet1DUNet(nn.Module):
         mask: torch.Tensor,
         mu: torch.Tensor,
         t: torch.Tensor,
+        spk_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -249,20 +270,26 @@ class ResNet1DUNet(nn.Module):
             mask (torch.Tensor): Padding mask of shape (batch_size, 1, time). 1=valid, 0=pad.
             mu (torch.Tensor): Encoder output of shape (batch_size, in_channels, time).
             t (torch.Tensor): Timestep of shape (batch_size,).
+            spk_emb (torch.Tensor | None): Speaker embedding of shape (batch_size, spk_emb_dim).
 
         Returns:
             torch.Tensor: Predicted velocity of shape (batch_size, out_channels, time).
         """
         t_emb = self.time_embeddings(t)
 
-        x = torch.cat([x, mu], dim=1)  # (B, 2*in_channels, T)
+        if spk_emb is not None:
+            spk_t = spk_emb.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+            x = torch.cat([x, mu, spk_t], dim=1)  # (B, 2*in_channels + spk_emb_dim, T)
+        else:
+            x = torch.cat([x, mu], dim=1)  # (B, 2*in_channels, T)
 
         # down
         hiddens = []
         masks = [mask]
-        for resnet, transformer_blocks, downsample in self.down_blocks:  # type: ignore[misc]
+        for resnets, transformer_blocks, downsample in self.down_blocks:  # type: ignore[misc]
             mask_down = masks[-1]
-            x = resnet(x, mask_down, t_emb)
+            for resnet in resnets:
+                x = resnet(x, mask_down, t_emb)
             for transformer_block in transformer_blocks:
                 x = transformer_block(x, mask_down, t_emb)
             hiddens.append(x)
@@ -278,12 +305,13 @@ class ResNet1DUNet(nn.Module):
                 x = transformer_block(x, mask_mid, t_emb)
 
         # up
-        for resnet, transformer_blocks, upsample in self.up_blocks:  # type: ignore[misc]
+        for resnets, transformer_blocks, upsample in self.up_blocks:  # type: ignore[misc]
             mask_up = masks.pop()
             skip = hiddens.pop()
             x = x[..., : skip.shape[-1]]  # trim if upsample overshot (odd lengths)
             x = torch.cat([x, skip], dim=1)  # skip connection
-            x = resnet(x, mask_up, t_emb)
+            for resnet in resnets:
+                x = resnet(x, mask_up, t_emb)
             for transformer_block in transformer_blocks:
                 x = transformer_block(x, mask_up, t_emb)
             x = upsample(x * mask_up)

@@ -37,9 +37,6 @@ class CharTokenizer:
         output_dir.mkdir(parents=True, exist_ok=True)
         save_path = output_dir / f"{model_prefix}.txt"
 
-        if save_path.exists():
-            return cls.load(save_path)
-
         if not isinstance(text_path, list):
             text_path = [text_path]
 
@@ -51,7 +48,9 @@ class CharTokenizer:
         vocab = sorted(chars)
         instance = cls(vocab)
         save_path.write_text(
-            "\n".join(instance._id_to_token[i] for i in range(len(instance._id_to_token)))
+            "\n".join(
+                instance._id_to_token[i] for i in range(len(instance._id_to_token))
+            )
         )
         return instance
 
